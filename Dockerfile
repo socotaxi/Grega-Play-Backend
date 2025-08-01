@@ -1,26 +1,22 @@
-# Image Node.js + FFmpeg
-FROM jrottenberg/ffmpeg:4.4-ubuntu
+# Étape 1 : partir d’une image Node.js officielle (inclut npm)
+FROM node:18-slim
 
-# Créer dossier app
+# Étape 2 : installer FFmpeg
+RUN apt-get update && apt-get install -y ffmpeg
+
+# Étape 3 : créer dossier de travail
 WORKDIR /app
 
-# Installer Node.js (v18)
-RUN apt-get update && apt-get install -y curl gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
-    apt-get install -y nodejs
-
-# Copier et installer les dépendances
+# Étape 4 : copier les fichiers et installer dépendances
 COPY package*.json ./
 RUN npm install
-
-# Copier le reste de l'app
 COPY . .
 
-# Créer dossier temporaire
+# Étape 5 : créer dossier temporaire pour montage vidéo
 RUN mkdir -p /app/tmp
 
-# Exposer le port
+# Étape 6 : exposer le port (Railway utilise 3000 par défaut)
 EXPOSE 3000
 
-# Démarrer le backend
+# Étape 7 : lancer le serveur
 CMD ["node", "services/server.js"]
