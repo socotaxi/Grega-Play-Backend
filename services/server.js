@@ -13,7 +13,7 @@ const app = express();
 const PORT = 4000; // <-- 🚨 Changement ici
 
 const corsOptions = {
-  origin: ['http://localhost:3000', 'http://127.0.0.1:3000', 'https://grega-play.vercel.app'],
+  origin: ['http://localhost:3000', 'http://127.0.0.1:3000', 'https://grega-play.vercel.app', 'https://grega-play-frontend.vercel.app'],
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
   credentials: false,
