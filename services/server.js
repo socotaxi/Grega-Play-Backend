@@ -12,7 +12,14 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = 4000; // <-- 🚨 Changement ici
 
-app.use(cors());
+const corsOptions = {
+  origin: ['http://localhost:3000', 'http://127.0.0.1:3000', 'https://grega-play.vercel.app'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  credentials: false,
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 const supabase = createClient(
