@@ -1,3 +1,5 @@
+const logoPath = path.resolve('assets/logo.png');
+
 const path = require('path');
 if (!process.env.SUPABASE_URL) {
   require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
@@ -53,11 +55,13 @@ async function processVideo(eventId) {
   console.log(`📄 Contenu de list.txt :\n${ffmpegList}`);
   fs.writeFileSync(listPath, ffmpegList);
 
-  const outputPath = path.join(tempDir, 'final.mp4');
+  const concatPath = path.join(tempDir, 'concat.mp4'); // avant watermark
+  const outputPath = path.join(tempDir, 'final.mp4');  // après watermark
 
   // 5. Lancer FFmpeg
-  await runFFmpegConcat(listPath.replace(/\\/g, '/'), outputPath);
-
+  await runFFmpegConcat(listPath.replace(/\\/g, '/'), concatPath);
+  await runFFmpegWatermark(concatPath, logoPath, outputPath);
+  
   // 6. Upload final.mp4 dans Supabase
   const buffer = fs.readFileSync(outputPath);
   const supabasePath = `final_videos/${eventId}.mp4`;
@@ -103,18 +107,19 @@ function downloadFile(url, outputPath) {
   });
 }
 
-function runFFmpegConcat(listPath, outputPath) {
+function runFFmpegWatermark(inputPath, logoPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
+    const cmd = `ffmpeg -y -i "${inputPath}" -i "${logoPath}" -filter_complex "overlay=W-w-10:H-h-10" -c:a copy "${outputPath}"`;
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
         console.error(stderr || stdout);
-        reject(new Error('Erreur FFmpeg'));
+        reject(new Error('Erreur FFmpeg (watermark)'));
       } else {
         resolve();
       }
     });
   });
 }
+
 
 module.exports = processVideo;
