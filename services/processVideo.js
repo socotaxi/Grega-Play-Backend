@@ -1,9 +1,9 @@
-const logoPath = path.resolve('assets/logo.png');
-
 const path = require('path');
 if (!process.env.SUPABASE_URL) {
   require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 }
+
+const logoPath = path.resolve('assets/logo.png');
 
 const fs = require('fs');
 const { exec } = require('child_process');
