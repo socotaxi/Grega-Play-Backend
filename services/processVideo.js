@@ -121,5 +121,19 @@ function runFFmpegWatermark(inputPath, logoPath, outputPath) {
   });
 }
 
+function runFFmpegConcat(listPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const cmd = `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error('❌ FFmpeg concat error:', stderr || stdout);
+        reject(new Error('Erreur FFmpeg (concat)'));
+      } else {
+        console.log('✅ FFmpeg concat terminé');
+        resolve();
+      }
+    });
+  });
+}
 
 module.exports = processVideo;
