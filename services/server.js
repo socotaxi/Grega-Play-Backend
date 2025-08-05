@@ -149,6 +149,76 @@ app.delete('/api/videos/:id', async (req, res) => {
   res.status(200).json({ success: true });
 });
 
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const tmp = require('os').tmpdir();
+const execAsync = promisify(exec);
+
+app.post('/api/videos/upload-and-compress', upload.single('file'), async (req, res) => {
+  const { eventId, participantName } = req.body;
+  const file = req.file;
+
+  if (!eventId || !participantName || !file) {
+    return res.status(400).json({ error: 'Paramètres manquants' });
+  }
+
+  const rawPath = path.join(tmp, `raw-${Date.now()}.mp4`);
+  const compressedPath = path.join(tmp, `compressed-${Date.now()}.mp4`);
+
+  try {
+    // Écrit le fichier brut temporairement
+    fs.writeFileSync(rawPath, file.buffer);
+
+    // Compression avec FFmpeg
+    const cmd = `ffmpeg -y -i "${rawPath}" -vf "scale=640:-2" -b:v 800k -preset ultrafast "${compressedPath}"`;
+    await execAsync(cmd);
+
+    const buffer = fs.readFileSync(compressedPath);
+    const filename = `compressed/${eventId}/${Date.now()}-${file.originalname}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('videos')
+      .upload(filename, buffer, {
+        contentType: 'video/mp4',
+        upsert: true,
+      });
+
+    if (uploadError) throw uploadError;
+
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${filename}`;
+
+    const { data: insertData, error: insertError } = await supabase
+      .from('videos')
+      .insert([
+        {
+          event_id: eventId,
+          participant_name: participantName,
+          storage_path: filename,
+          video_url: publicUrl,
+        },
+      ])
+      .select();
+
+    if (insertError) throw insertError;
+
+    // Nettoyage des fichiers temporaires
+    fs.unlinkSync(rawPath);
+    fs.unlinkSync(compressedPath);
+
+    res.status(200).json(insertData[0]);
+  } catch (err) {
+    console.error('❌ Erreur compression/upload vidéo :', err);
+    res.status(500).json({ error: "Erreur lors de la compression ou de l'upload" });
+
+    try {
+      if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+      if (fs.existsSync(compressedPath)) fs.unlinkSync(compressedPath);
+    } catch (e) {
+      console.warn('⚠️ Erreur suppression fichiers temporaires', e);
+    }
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Backend Grega Play en écoute sur http://localhost:${PORT}`);
 });
