@@ -2,7 +2,7 @@
 FROM node:18-slim
 
 # Étape 2 : installer FFmpeg
-RUN apt-get update && apt-get install -y ffmpeg
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Étape 3 : créer dossier de travail
 WORKDIR /app

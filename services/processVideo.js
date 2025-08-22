@@ -8,8 +8,8 @@ const logoPath = path.resolve('assets/logo.png');
 const fs = require('fs');
 const { exec } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
-const { get } = require('https');
-const { get: getHttp } = require('http');
+const https = require('https');
+const http = require('http');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -20,6 +20,7 @@ async function processVideo(eventId) {
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
 
   // 1. Récupérer les vidéos liées à l’événement
+  console.log("➡️ Étape 1 : Récupération des vidéos depuis Supabase...");
   const { data: videos, error } = await supabase
     .from('videos')
     .select('storage_path')
@@ -30,10 +31,12 @@ async function processVideo(eventId) {
   }
 
   // 2. Créer un dossier temporaire
+  console.log("➡️ Étape 2 : Préparation des fichiers temporaires...");
   const tempDir = path.join('tmp', eventId);
   fs.mkdirSync(tempDir, { recursive: true });
 
   // 3. Télécharger les vidéos
+  console.log("➡️ Étape 3 : Concaténation des vidéos avec FFmpeg...");
   const downloadedPaths = [];
   for (let i = 0; i < videos.length; i++) {
     const { publicUrl } = supabase
@@ -47,6 +50,7 @@ async function processVideo(eventId) {
   }
 
   // 4. Créer le fichier list.txt avec chemins absolus
+  console.log("➡️ Étape 4 : Ajout du watermark...");
   const listPath = path.join(tempDir, 'list.txt');
   const ffmpegList = downloadedPaths
     .map(p => `file '${path.resolve(p).replace(/\\/g, '/')}'`)
@@ -59,10 +63,12 @@ async function processVideo(eventId) {
   const outputPath = path.join(tempDir, 'final.mp4');  // après watermark
 
   // 5. Lancer FFmpeg
+  console.log("➡️ Étape 5 : Upload de la vidéo finale vers Supabase...");
   await runFFmpegConcat(listPath.replace(/\\/g, '/'), concatPath);
   await runFFmpegWatermark(concatPath, logoPath, outputPath);
   
   // 6. Upload final.mp4 dans Supabase
+  console.log("➡️ Étape 6 : Récupération de l’URL publique...");
   const buffer = fs.readFileSync(outputPath);
   const supabasePath = `final_videos/${eventId}.mp4`;
 
@@ -84,6 +90,7 @@ async function processVideo(eventId) {
     .getPublicUrl(supabasePath).data;
 
   // 7. Mettre à jour l'événement
+  console.log("➡️ Étape 7 : Mise à jour de la base de données...");
   await supabase
     .from('events')
     .update({
@@ -96,14 +103,22 @@ async function processVideo(eventId) {
   return { videoUrl: publicUrl };
 }
 
+// ---- Helpers ----
 function downloadFile(url, outputPath) {
-  const protocol = url.startsWith('https') ? get : getHttp;
+  const client = url.startsWith('https') ? https : http;
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(outputPath);
-    protocol(url, response => {
-      response.pipe(file);
+
+    const req = client.get(url, { rejectUnauthorized: false }, res => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Échec téléchargement ${url}: ${res.statusCode}`));
+      }
+      res.pipe(file);
       file.on('finish', () => file.close(resolve));
-    }).on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.end();
   });
 }
 
