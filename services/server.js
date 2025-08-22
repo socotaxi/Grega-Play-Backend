@@ -7,7 +7,6 @@ import { fileURLToPath } from "url";
 import { exec } from "child_process";
 import util from "util";
 import { createClient } from "@supabase/supabase-js";
-import processVideo from "./processVideo.js";
 
 const execAsync = util.promisify(exec);
 const app = express();
@@ -21,14 +20,11 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) {
-        return callback(null, true); // autoriser Postman/cURL
-      }
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+      if (!origin) return callback(null, true); // autoriser Postman/cURL
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+
       console.warn("❌ Origin non autorisée :", origin);
-      return callback(null, false); // pas d’erreur bloquante
+      return callback(null, false); // ne bloque pas avec erreur
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -36,7 +32,6 @@ app.use(
   })
 );
 
-// ✅ Répond aux preflight OPTIONS
 app.options("*", cors());
 
 // 📋 Logger middleware
@@ -66,9 +61,13 @@ const upload = multer({
 });
 
 // 🔑 Supabase client
+console.log("🔑 Vérification variables d'environnement :");
+console.log("   SUPABASE_URL:", process.env.SUPABASE_URL ? "OK" : "❌ MISSING");
+console.log("   SUPABASE_SERVICE_ROLE_KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY ? "OK" : "❌ MISSING");
+
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 );
 
 // ======================================================
@@ -138,9 +137,7 @@ app.post(
       res.status(200).json(insertData[0]);
     } catch (err) {
       console.error("❌ Erreur compression/upload vidéo :", err);
-      res
-        .status(500)
-        .json({ error: "Erreur lors de la compression ou de l'upload" });
+      res.status(500).json({ error: "Erreur lors de la compression ou de l'upload" });
     }
   }
 );
@@ -190,7 +187,7 @@ app.delete("/api/videos/:id", async (req, res) => {
 });
 
 // ======================================================
-// ✅ Générer la vidéo finale
+// ✅ Générer la vidéo finale (import dynamique)
 // ======================================================
 app.post("/api/videos/process", async (req, res) => {
   const { eventId } = req.body;
@@ -200,13 +197,12 @@ app.post("/api/videos/process", async (req, res) => {
   }
 
   try {
+    const { default: processVideo } = await import("./processVideo.js");
     const finalVideoUrl = await processVideo(eventId);
     res.status(200).json({ finalVideoUrl });
   } catch (err) {
     console.error("❌ Erreur génération vidéo finale :", err);
-    res
-      .status(500)
-      .json({ error: "Erreur lors de la génération de la vidéo finale" });
+    res.status(500).json({ error: "Erreur lors de la génération de la vidéo finale" });
   }
 });
 
