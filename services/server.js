@@ -1,20 +1,3 @@
-console.log("🚀 Lancement backend Grega Play...");
-console.log("Node version:", process.version);
-console.log("Process PID:", process.pid);
-console.log("ENV PORT:", process.env.PORT);
-console.log("Listening will be on:", process.env.PORT || 3000);
-
-process.on("uncaughtException", (err) => {
-  console.error("❌ uncaughtException:", err);
-});
-process.on("unhandledRejection", (reason, p) => {
-  console.error("❌ unhandledRejection:", reason);
-});
-process.on("SIGTERM", () => {
-  console.warn("⚠️ SIGTERM reçu par le container");
-});
-
-
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -27,6 +10,23 @@ import { createClient } from "@supabase/supabase-js";
 
 const execAsync = util.promisify(exec);
 const app = express();
+
+// 🚀 Logs globaux au démarrage
+console.log("🚀 Backend Grega Play lancé");
+console.log("Node version:", process.version);
+console.log("Process PID:", process.pid);
+console.log("ENV PORT:", process.env.PORT);
+
+// Catch global errors
+process.on("uncaughtException", (err) => {
+  console.error("❌ uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason, p) => {
+  console.error("❌ unhandledRejection:", reason);
+});
+process.on("SIGTERM", () => {
+  console.warn("⚠️ SIGTERM reçu, le container va s’arrêter.");
+});
 
 // 🌍 Config CORS
 const allowedOrigins = [
