@@ -13,28 +13,19 @@ const execAsync = util.promisify(exec);
 
 const app = express();
 
-// 🌍 Config CORS
 const allowedOrigins = [
-  "http://localhost:3000", // dev local
-  "https://grega-play-frontend.vercel.app" // frontend prod
+  "http://localhost:3000", // dev
+  "https://grega-play-frontend.vercel.app" // prod
 ];
 
 app.use(
   cors({
-    origin: function (origin, callback) {
-      // Autorise sans origin (Postman, curl) OU si présent dans la whitelist
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
+    origin: allowedOrigins,
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
-  })
-);
-
+  }));
+  
 app.use(express.json());
 
 // 📂 Résolution chemins
@@ -47,7 +38,7 @@ if (!fs.existsSync(tmp)) {
   fs.mkdirSync(tmp);
 }
 
-// ⚙️ Multer : stockage disque
+// ⚙️ Multer : stockage disque (pas mémoire)
 const upload = multer({
   dest: tmp,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
@@ -80,11 +71,14 @@ app.post(
     );
 
     try {
+      // ✅ Copier depuis le chemin temporaire Multer
       fs.copyFileSync(file.path, rawPath);
 
+      // 🎬 Compression avec FFmpeg
       const cmd = `ffmpeg -y -i "${rawPath}" -vf "scale=640:-2" -b:v 800k -preset ultrafast "${compressedPath}"`;
       await execAsync(cmd);
 
+      // 📤 Upload vers Supabase Storage
       const buffer = fs.readFileSync(compressedPath);
       const filename = `compressed/${eventId}/${Date.now()}-${file.originalname}`;
 
@@ -97,8 +91,10 @@ app.post(
 
       if (uploadError) throw uploadError;
 
+      // 🔗 Générer l’URL publique
       const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${filename}`;
 
+      // 💾 Enregistrement en BDD
       const { data: insertData, error: insertError } = await supabase
         .from("videos")
         .insert([
@@ -113,6 +109,7 @@ app.post(
 
       if (insertError) throw insertError;
 
+      // 🧹 Nettoyage fichiers temporaires
       fs.unlinkSync(rawPath);
       fs.unlinkSync(compressedPath);
 
@@ -171,7 +168,7 @@ app.delete("/api/videos/:id", async (req, res) => {
 });
 
 // ======================================================
-// ✅ Générer la vidéo finale
+// ✅ Générer la vidéo finale (concat avec FFmpeg)
 // ======================================================
 app.post("/api/videos/process", async (req, res) => {
   const { eventId } = req.body;
