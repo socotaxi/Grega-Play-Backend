@@ -10,22 +10,41 @@ import { createClient } from "@supabase/supabase-js";
 import processVideo from "./processVideo.js";
 
 const execAsync = util.promisify(exec);
-
 const app = express();
 
+// 🌍 Config CORS
 const allowedOrigins = [
-  "http://localhost:3000", // dev
-  "https://grega-play-frontend.vercel.app" // prod
+  "http://localhost:3000",            // dev local
+  "https://grega-play-frontend.vercel.app" // prod Vercel
 ];
 
 app.use(
   cors({
-    origin: allowedOrigins,
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn("❌ Origin non autorisée :", origin);
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
-  }));
-  
+  })
+);
+
+// ✅ Répond aux preflight OPTIONS
+app.options("*", cors());
+
+// 📋 Logger middleware
+app.use((req, res, next) => {
+  console.log(
+    `🌍 [${new Date().toISOString()}] ${req.method} ${req.originalUrl} | Origin: ${req.headers.origin || "N/A"}`
+  );
+  next();
+});
+
 app.use(express.json());
 
 // 📂 Résolution chemins
@@ -38,7 +57,7 @@ if (!fs.existsSync(tmp)) {
   fs.mkdirSync(tmp);
 }
 
-// ⚙️ Multer : stockage disque (pas mémoire)
+// ⚙️ Multer : stockage disque
 const upload = multer({
   dest: tmp,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
@@ -71,14 +90,11 @@ app.post(
     );
 
     try {
-      // ✅ Copier depuis le chemin temporaire Multer
       fs.copyFileSync(file.path, rawPath);
 
-      // 🎬 Compression avec FFmpeg
       const cmd = `ffmpeg -y -i "${rawPath}" -vf "scale=640:-2" -b:v 800k -preset ultrafast "${compressedPath}"`;
       await execAsync(cmd);
 
-      // 📤 Upload vers Supabase Storage
       const buffer = fs.readFileSync(compressedPath);
       const filename = `compressed/${eventId}/${Date.now()}-${file.originalname}`;
 
@@ -91,10 +107,8 @@ app.post(
 
       if (uploadError) throw uploadError;
 
-      // 🔗 Générer l’URL publique
       const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${filename}`;
 
-      // 💾 Enregistrement en BDD
       const { data: insertData, error: insertError } = await supabase
         .from("videos")
         .insert([
@@ -109,7 +123,6 @@ app.post(
 
       if (insertError) throw insertError;
 
-      // 🧹 Nettoyage fichiers temporaires
       fs.unlinkSync(rawPath);
       fs.unlinkSync(compressedPath);
 
@@ -168,7 +181,7 @@ app.delete("/api/videos/:id", async (req, res) => {
 });
 
 // ======================================================
-// ✅ Générer la vidéo finale (concat avec FFmpeg)
+// ✅ Générer la vidéo finale
 // ======================================================
 app.post("/api/videos/process", async (req, res) => {
   const { eventId } = req.body;
