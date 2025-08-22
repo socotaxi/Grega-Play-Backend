@@ -22,15 +22,13 @@ app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin) {
-        // Autoriser les requêtes sans origin (Postman, cURL)
-        return callback(null, true);
+        return callback(null, true); // autoriser Postman/cURL
       }
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
       console.warn("❌ Origin non autorisée :", origin);
-      // ⚠️ IMPORTANT : renvoyer false et pas une erreur
-      return callback(null, false);
+      return callback(null, false); // pas d’erreur bloquante
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -72,6 +70,13 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+// ======================================================
+// 🚑 Route de test
+// ======================================================
+app.get("/ping", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
 
 // ======================================================
 // ✅ Upload + compression vidéo
