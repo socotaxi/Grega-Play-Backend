@@ -14,7 +14,7 @@ const app = express();
 
 // 🌍 Config CORS
 const allowedOrigins = [
-  "http://localhost:3000",            // dev local
+  "http://localhost:3000",                 // dev local
   "https://grega-play-frontend.vercel.app" // prod Vercel
 ];
 
@@ -68,6 +68,13 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+// ======================================================
+// ✅ Route de health-check (utile Railway)
+// ======================================================
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
 
 // ======================================================
 // ✅ Upload + compression vidéo
