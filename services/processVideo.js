@@ -16,10 +16,6 @@ if (!process.env.SUPABASE_URL) {
   dotenv.config({ path: path.resolve(__dirname, "../.env") });
 }
 
-// ✅ Chemin du logo watermark
-const logoPath = path.resolve("assets/logo.png");
-const logoExists = fs.existsSync(logoPath);
-
 // 🔑 Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -82,14 +78,9 @@ export default async function processVideo(eventId) {
   console.log("➡️ Étape 5 : Concaténation avec FFmpeg...");
   await runFFmpegConcat(listPath.replace(/\\/g, "/"), concatPath);
 
-  // 6. Watermark (si logo présent)
-  if (logoExists) {
-    console.log("➡️ Étape 6 : Application du watermark...");
-    await runFFmpegWatermark(concatPath, logoPath, outputPath);
-  } else {
-    console.warn("⚠️ Logo watermark introuvable, on garde concat.mp4 comme final.mp4");
-    fs.copyFileSync(concatPath, outputPath);
-  }
+  // ✅ On garde concat.mp4 comme final.mp4
+  console.log("➡️ Étape 6 : Copie du fichier concaténé vers final.mp4...");
+  fs.copyFileSync(concatPath, outputPath);
 
   // 7. Upload final.mp4 dans Supabase
   console.log("➡️ Étape 7 : Upload du fichier final vers Supabase...");
@@ -145,22 +136,6 @@ function downloadFile(url, outputPath) {
 
     req.on("error", reject);
     req.end();
-  });
-}
-
-function runFFmpegWatermark(inputPath, logoPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -i "${inputPath}" -i "${logoPath}" -filter_complex "overlay=W-w-10:H-h-10" -c:a copy "${outputPath}"`;
-    console.log("➡️ Commande FFmpeg watermark:", cmd);
-    exec(cmd, (error, stdout, stderr) => {
-      if (error) {
-        console.error("❌ FFmpeg watermark error:", stderr || stdout);
-        reject(new Error("Erreur FFmpeg (watermark)"));
-      } else {
-        console.log("✅ FFmpeg watermark terminé");
-        resolve();
-      }
-    });
   });
 }
 

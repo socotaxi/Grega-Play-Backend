@@ -1,28 +1,26 @@
-# Étape 1 : partir d’une image Node.js officielle (inclut npm)
-FROM node:20-slim
+# Utiliser une image Node avec FFmpeg déjà installé
+FROM node:20-bullseye
 
-# Étape 2 : installer FFmpeg
+# Installer FFmpeg
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Étape 3 : créer dossier de travail
+# Définir le dossier de travail
 WORKDIR /app
 
-# Étape 4 : copier les fichiers et installer dépendances
+# Copier les fichiers package.json et package-lock.json / pnpm-lock.yaml
 COPY package*.json ./
-RUN npm install
+
+# Installer les dépendances
+RUN npm install --production
+
+# Copier le reste du code de l’application
 COPY . .
 
-# ✅ Étape spéciale : s'assurer que le logo est bien présent
-RUN mkdir -p /app/assets
-COPY assets/logo.png /app/assets/logo.png
-
-# Étape 5 : créer dossier temporaire pour montage vidéo
+# Créer un dossier tmp pour les vidéos si inexistant
 RUN mkdir -p /app/tmp
 
-# Étape 6 : exposer le port utilisé par Railway
+# Exposer le port
 EXPOSE 8080
 
-# Étape 7 : lancer le serveur
+# Lancer le serveur
 CMD ["npm", "start"]
-
-# Étape 8 : fini!
