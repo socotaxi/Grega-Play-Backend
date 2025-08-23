@@ -24,3 +24,5 @@ EXPOSE 8080
 
 # Étape 7 : lancer le serveur
 CMD ["npm", "start"]
+
+# Étape 8 : fini!
