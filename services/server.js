@@ -1,4 +1,5 @@
 import express from "express";
+import dotenv from "dotenv";
 import cors from "cors";
 import multer from "multer";
 import fs from "fs";
@@ -10,6 +11,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const execAsync = util.promisify(exec);
 const app = express();
+dotenv.config();
 
 // 🚀 Logs globaux au démarrage
 console.log("🚀 Backend Grega Play lancé");
