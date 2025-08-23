@@ -12,6 +12,10 @@ COPY package*.json ./
 RUN npm install
 COPY . .
 
+# ✅ Étape spéciale : s'assurer que le logo est bien présent
+RUN mkdir -p /app/assets
+COPY assets/logo.png /app/assets/logo.png
+
 # Étape 5 : créer dossier temporaire pour montage vidéo
 RUN mkdir -p /app/tmp
 
