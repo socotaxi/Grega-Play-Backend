@@ -11,12 +11,14 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Charger .env si nécessaire
+// Charger .env si nécessaire (utile en local)
 if (!process.env.SUPABASE_URL) {
   dotenv.config({ path: path.resolve(__dirname, "../.env") });
 }
 
+// ✅ Chemin du logo watermark
 const logoPath = path.resolve("assets/logo.png");
+const logoExists = fs.existsSync(logoPath);
 
 // 🔑 Supabase client
 const supabase = createClient(
@@ -34,9 +36,14 @@ export default async function processVideo(eventId) {
     .select("storage_path")
     .eq("event_id", eventId);
 
-  if (error || !videos || videos.length === 0) {
+  if (error) {
+    console.error("❌ Erreur Supabase:", error.message);
+    throw new Error("Impossible de récupérer les vidéos");
+  }
+  if (!videos || videos.length === 0) {
     throw new Error("Aucune vidéo trouvée pour cet événement.");
   }
+  console.log(`✅ ${videos.length} vidéos trouvées.`);
 
   // 2. Créer un dossier temporaire
   console.log("➡️ Étape 2 : Préparation des fichiers temporaires...");
@@ -44,7 +51,7 @@ export default async function processVideo(eventId) {
   fs.mkdirSync(tempDir, { recursive: true });
 
   // 3. Télécharger les vidéos
-  console.log("➡️ Étape 3 : Concaténation des vidéos avec FFmpeg...");
+  console.log("➡️ Étape 3 : Téléchargement des vidéos...");
   const downloadedPaths = [];
   for (let i = 0; i < videos.length; i++) {
     const { publicUrl } = supabase
@@ -52,13 +59,14 @@ export default async function processVideo(eventId) {
       .from("videos")
       .getPublicUrl(videos[i].storage_path).data;
 
+    console.log(`⬇️ Téléchargement : ${publicUrl}`);
     const localPath = path.join(tempDir, `video${i}.mp4`);
     await downloadFile(publicUrl, localPath);
     downloadedPaths.push(localPath);
   }
 
-  // 4. Créer le fichier list.txt avec chemins absolus
-  console.log("➡️ Étape 4 : Ajout du watermark...");
+  // 4. Créer le fichier list.txt
+  console.log("➡️ Étape 4 : Création du fichier list.txt...");
   const listPath = path.join(tempDir, "list.txt");
   const ffmpegList = downloadedPaths
     .map((p) => `file '${path.resolve(p).replace(/\\/g, "/")}'`)
@@ -67,16 +75,24 @@ export default async function processVideo(eventId) {
   console.log(`📄 Contenu de list.txt :\n${ffmpegList}`);
   fs.writeFileSync(listPath, ffmpegList);
 
-  const concatPath = path.join(tempDir, "concat.mp4"); // avant watermark
-  const outputPath = path.join(tempDir, "final.mp4"); // après watermark
+  const concatPath = path.join(tempDir, "concat.mp4");
+  const outputPath = path.join(tempDir, "final.mp4");
 
-  // 5. Lancer FFmpeg
-  console.log("➡️ Étape 5 : Upload de la vidéo finale vers Supabase...");
+  // 5. Lancer FFmpeg concat
+  console.log("➡️ Étape 5 : Concaténation avec FFmpeg...");
   await runFFmpegConcat(listPath.replace(/\\/g, "/"), concatPath);
-  await runFFmpegWatermark(concatPath, logoPath, outputPath);
 
-  // 6. Upload final.mp4 dans Supabase
-  console.log("➡️ Étape 6 : Récupération de l’URL publique...");
+  // 6. Watermark (si logo présent)
+  if (logoExists) {
+    console.log("➡️ Étape 6 : Application du watermark...");
+    await runFFmpegWatermark(concatPath, logoPath, outputPath);
+  } else {
+    console.warn("⚠️ Logo watermark introuvable, on garde concat.mp4 comme final.mp4");
+    fs.copyFileSync(concatPath, outputPath);
+  }
+
+  // 7. Upload final.mp4 dans Supabase
+  console.log("➡️ Étape 7 : Upload du fichier final vers Supabase...");
   const buffer = fs.readFileSync(outputPath);
   const supabasePath = `final_videos/${eventId}.mp4`;
 
@@ -88,6 +104,7 @@ export default async function processVideo(eventId) {
     });
 
   if (uploadError) {
+    console.error("❌ Erreur upload Supabase:", uploadError.message);
     throw new Error("Échec de l’upload dans Supabase Storage");
   }
 
@@ -96,8 +113,8 @@ export default async function processVideo(eventId) {
     .from("videos")
     .getPublicUrl(supabasePath).data;
 
-  // 7. Mettre à jour l'événement
-  console.log("➡️ Étape 7 : Mise à jour de la base de données...");
+  // 8. Mettre à jour l'événement
+  console.log("➡️ Étape 8 : Mise à jour de la base de données...");
   await supabase
     .from("events")
     .update({
@@ -134,11 +151,13 @@ function downloadFile(url, outputPath) {
 function runFFmpegWatermark(inputPath, logoPath, outputPath) {
   return new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -i "${inputPath}" -i "${logoPath}" -filter_complex "overlay=W-w-10:H-h-10" -c:a copy "${outputPath}"`;
+    console.log("➡️ Commande FFmpeg watermark:", cmd);
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
-        console.error(stderr || stdout);
+        console.error("❌ FFmpeg watermark error:", stderr || stdout);
         reject(new Error("Erreur FFmpeg (watermark)"));
       } else {
+        console.log("✅ FFmpeg watermark terminé");
         resolve();
       }
     });
@@ -148,6 +167,7 @@ function runFFmpegWatermark(inputPath, logoPath, outputPath) {
 function runFFmpegConcat(listPath, outputPath) {
   return new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
+    console.log("➡️ Commande FFmpeg concat:", cmd);
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
         console.error("❌ FFmpeg concat error:", stderr || stdout);
