@@ -32,7 +32,8 @@ process.on("SIGTERM", () => {
 
 // 🌍 Config CORS
 const allowedOrigins = [
-  "http://localhost:3000",            // dev local
+   "http://127.0.0.1:3000",
+  "http://localhost:5173",            // dev local
   "https://grega-play-frontend.vercel.app" // prod Vercel
 ];
 
@@ -218,7 +219,9 @@ app.post("/api/videos/process", async (req, res) => {
   try {
     const { default: processVideo } = await import("./processVideo.js");
     const finalVideoUrl = await processVideo(eventId);
-    res.status(200).json({ finalVideoUrl });
+
+    // 🔄 Correction ici
+    res.status(200).json({ videoUrl: finalVideoUrl });
   } catch (err) {
     console.error("❌ Erreur génération vidéo finale :", err);
     res.status(500).json({ error: "Erreur lors de la génération de la vidéo finale" });
