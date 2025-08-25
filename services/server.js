@@ -13,17 +13,15 @@ const execAsync = util.promisify(exec);
 const app = express();
 dotenv.config();
 
-// 🚀 Logs globaux au démarrage
 console.log("🚀 Backend Grega Play lancé");
 console.log("Node version:", process.version);
 console.log("Process PID:", process.pid);
 console.log("ENV PORT:", process.env.PORT);
 
-// Catch global errors
 process.on("uncaughtException", (err) => {
   console.error("❌ uncaughtException:", err);
 });
-process.on("unhandledRejection", (reason, p) => {
+process.on("unhandledRejection", (reason) => {
   console.error("❌ unhandledRejection:", reason);
 });
 process.on("SIGTERM", () => {
@@ -32,36 +30,32 @@ process.on("SIGTERM", () => {
 
 // 🌍 Config CORS
 const allowedOrigins = [
-   "http://127.0.0.1:3000",
-  "http://localhost:5173",            // dev local
-  "https://grega-play-frontend.vercel.app" // prod Vercel
+  "http://127.0.0.1:3000",
+  "http://localhost:5173",
+  "https://grega-play-frontend.vercel.app",
 ];
-
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true); // autoriser Postman/cURL
+      if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
-
       console.warn("❌ Origin non autorisée :", origin);
-      return callback(null, false); // ne bloque pas avec erreur
+      return callback(null, false);
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   })
 );
-
 app.options("*", cors());
 
-// 📋 Logger middleware
+// 📋 Logger
 app.use((req, res, next) => {
   console.log(
     `🌍 [${new Date().toISOString()}] ${req.method} ${req.originalUrl} | Origin: ${req.headers.origin || "N/A"}`
   );
   next();
 });
-
 app.use(express.json());
 
 // 📂 Résolution chemins
@@ -74,7 +68,7 @@ if (!fs.existsSync(tmp)) {
   fs.mkdirSync(tmp);
 }
 
-// ⚙️ Multer : stockage disque
+// ⚙️ Multer
 const upload = multer({
   dest: tmp,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
@@ -98,7 +92,16 @@ app.get("/ping", (req, res) => {
 });
 
 // ======================================================
-// ✅ Upload + compression vidéo
+// ✅ Helper : récupérer la durée avec ffprobe
+// ======================================================
+async function getVideoDuration(filePath) {
+  const cmd = `ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`;
+  const { stdout } = await execAsync(cmd);
+  return parseFloat(stdout);
+}
+
+// ======================================================
+// ✅ Upload + compression vidéo avec limite 10s
 // ======================================================
 app.post(
   "/api/videos/upload-and-compress",
@@ -120,6 +123,18 @@ app.post(
     try {
       fs.copyFileSync(file.path, rawPath);
 
+      // ✅ Vérifier durée max (10s)
+      const duration = await getVideoDuration(rawPath);
+      console.log(`🎞️ Durée détectée: ${duration}s`);
+      if (duration > 10) {
+        fs.unlinkSync(rawPath);
+        fs.unlinkSync(file.path);
+        return res.status(400).json({
+          error: "⛔ La vidéo dépasse la durée maximale autorisée (10 secondes).",
+        });
+      }
+
+      // Compression si durée ok
       const cmd = `ffmpeg -y -i "${rawPath}" -vf "scale=640:-2" -b:v 800k -preset ultrafast "${compressedPath}"`;
       await execAsync(cmd);
 
@@ -132,7 +147,6 @@ app.post(
           contentType: "video/mp4",
           upsert: true,
         });
-
       if (uploadError) throw uploadError;
 
       const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${filename}`;
@@ -148,16 +162,17 @@ app.post(
           },
         ])
         .select();
-
       if (insertError) throw insertError;
 
+      // Nettoyage
       fs.unlinkSync(rawPath);
       fs.unlinkSync(compressedPath);
+      fs.unlinkSync(file.path);
 
       res.status(200).json(insertData[0]);
     } catch (err) {
-      console.error("❌ Erreur compression/upload vidéo :", err);
-      res.status(500).json({ error: "Erreur lors de la compression ou de l'upload" });
+      console.error("❌ Erreur upload vidéo :", err);
+      res.status(500).json({ error: "Erreur lors de l'upload vidéo" });
     }
   }
 );
@@ -174,7 +189,6 @@ app.get("/api/videos", async (req, res) => {
       .select("*")
       .eq("event_id", eventId)
       .order("created_at", { ascending: true });
-
     if (error) throw error;
 
     res.status(200).json(data);
@@ -189,14 +203,12 @@ app.get("/api/videos", async (req, res) => {
 // ======================================================
 app.delete("/api/videos/:id", async (req, res) => {
   const { id } = req.params;
-
   try {
     const { data, error } = await supabase
       .from("videos")
       .delete()
       .eq("id", id)
       .select();
-
     if (error) throw error;
 
     res.status(200).json(data[0]);
@@ -207,20 +219,16 @@ app.delete("/api/videos/:id", async (req, res) => {
 });
 
 // ======================================================
-// ✅ Générer la vidéo finale (import dynamique)
+// ✅ Générer la vidéo finale
 // ======================================================
 app.post("/api/videos/process", async (req, res) => {
   const { eventId } = req.body;
-
   if (!eventId) {
     return res.status(400).json({ error: "eventId manquant" });
   }
-
   try {
     const { default: processVideo } = await import("./processVideo.js");
     const finalVideoUrl = await processVideo(eventId);
-
-    // 🔄 Correction ici
     res.status(200).json({ videoUrl: finalVideoUrl });
   } catch (err) {
     console.error("❌ Erreur génération vidéo finale :", err);

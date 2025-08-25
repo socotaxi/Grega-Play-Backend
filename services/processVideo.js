@@ -7,16 +7,13 @@ import http from "http";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 
-// 🔑 Pour résoudre __dirname en ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Charger .env si nécessaire (utile en local)
 if (!process.env.SUPABASE_URL) {
   dotenv.config({ path: path.resolve(__dirname, "../.env") });
 }
 
-// 🔑 Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -25,65 +22,58 @@ const supabase = createClient(
 export default async function processVideo(eventId) {
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
 
-  // 1. Récupérer les vidéos liées à l’événement
+  // 1. Récupérer les vidéos
   console.log("➡️ Étape 1 : Récupération des vidéos depuis Supabase...");
   const { data: videos, error } = await supabase
     .from("videos")
     .select("storage_path")
     .eq("event_id", eventId);
 
-  if (error) {
-    console.error("❌ Erreur Supabase:", error.message);
-    throw new Error("Impossible de récupérer les vidéos");
-  }
+  if (error) throw new Error("Impossible de récupérer les vidéos");
   if (!videos || videos.length === 0) {
     throw new Error("Aucune vidéo trouvée pour cet événement.");
   }
   console.log(`✅ ${videos.length} vidéos trouvées.`);
 
-  // 2. Créer un dossier temporaire
-  console.log("➡️ Étape 2 : Préparation des fichiers temporaires...");
+  // 2. Préparer temp dir
   const tempDir = path.join("tmp", eventId);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // 3. Télécharger les vidéos
-  console.log("➡️ Étape 3 : Téléchargement des vidéos...");
-  const downloadedPaths = [];
+  // 3. Télécharger et tronquer les vidéos à 10s
+  console.log("➡️ Étape 3 : Téléchargement + Tronquage à 10s...");
+  const processedPaths = [];
   for (let i = 0; i < videos.length; i++) {
-    const { publicUrl } = supabase
-      .storage
+    const { publicUrl } = supabase.storage
       .from("videos")
       .getPublicUrl(videos[i].storage_path).data;
 
     console.log(`⬇️ Téléchargement : ${publicUrl}`);
-    const localPath = path.join(tempDir, `video${i}.mp4`);
+    const localPath = path.join(tempDir, `video${i}_raw.mp4`);
     await downloadFile(publicUrl, localPath);
-    downloadedPaths.push(localPath);
+
+    // Tronquer à 10s
+    const trimmedPath = path.join(tempDir, `video${i}.mp4`);
+    await trimVideo(localPath, trimmedPath, 10);
+    processedPaths.push(trimmedPath);
   }
 
-  // 4. Créer le fichier list.txt
-  console.log("➡️ Étape 4 : Création du fichier list.txt...");
+  // 4. Créer list.txt
   const listPath = path.join(tempDir, "list.txt");
-  const ffmpegList = downloadedPaths
+  const ffmpegList = processedPaths
     .map((p) => `file '${path.resolve(p).replace(/\\/g, "/")}'`)
     .join("\n");
-
-  console.log(`📄 Contenu de list.txt :\n${ffmpegList}`);
   fs.writeFileSync(listPath, ffmpegList);
 
   const concatPath = path.join(tempDir, "concat.mp4");
   const outputPath = path.join(tempDir, "final.mp4");
 
-  // 5. Lancer FFmpeg concat
-  console.log("➡️ Étape 5 : Concaténation avec FFmpeg...");
+  // 5. Concat
   await runFFmpegConcat(listPath.replace(/\\/g, "/"), concatPath);
 
-  // ✅ On garde concat.mp4 comme final.mp4
-  console.log("➡️ Étape 6 : Copie du fichier concaténé vers final.mp4...");
+  // 6. Copier concat.mp4 → final.mp4
   fs.copyFileSync(concatPath, outputPath);
 
-  // 7. Upload final.mp4 dans Supabase
-  console.log("➡️ Étape 7 : Upload du fichier final vers Supabase...");
+  // 7. Upload final.mp4
   const buffer = fs.readFileSync(outputPath);
   const supabasePath = `final_videos/${eventId}.mp4`;
 
@@ -93,19 +83,13 @@ export default async function processVideo(eventId) {
       contentType: "video/mp4",
       upsert: true,
     });
+  if (uploadError) throw new Error("Échec de l’upload dans Supabase Storage");
 
-  if (uploadError) {
-    console.error("❌ Erreur upload Supabase:", uploadError.message);
-    throw new Error("Échec de l’upload dans Supabase Storage");
-  }
-
-  const { publicUrl } = supabase
-    .storage
+  const { publicUrl } = supabase.storage
     .from("videos")
     .getPublicUrl(supabasePath).data;
 
-  // 8. Mettre à jour l'événement
-  console.log("➡️ Étape 8 : Mise à jour de la base de données...");
+  // 8. Update event
   await supabase
     .from("events")
     .update({
@@ -126,9 +110,7 @@ function downloadFile(url, outputPath) {
 
     const req = client.get(url, { rejectUnauthorized: false }, (res) => {
       if (res.statusCode !== 200) {
-        return reject(
-          new Error(`Échec téléchargement ${url}: ${res.statusCode}`)
-        );
+        return reject(new Error(`Échec téléchargement ${url}: ${res.statusCode}`));
       }
       res.pipe(file);
       file.on("finish", () => file.close(resolve));
@@ -136,6 +118,23 @@ function downloadFile(url, outputPath) {
 
     req.on("error", reject);
     req.end();
+  });
+}
+
+// ✅ Nouveau helper : tronquer avec FFmpeg
+function trimVideo(inputPath, outputPath, maxSeconds = 10) {
+  return new Promise((resolve, reject) => {
+    const cmd = `ffmpeg -y -i "${inputPath}" -t ${maxSeconds} -c copy "${outputPath}"`;
+    console.log("➡️ FFmpeg trim:", cmd);
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ FFmpeg trim error:", stderr || stdout);
+        reject(new Error("Erreur FFmpeg (trim)"));
+      } else {
+        console.log("✅ Vidéo tronquée:", outputPath);
+        resolve();
+      }
+    });
   });
 }
 
