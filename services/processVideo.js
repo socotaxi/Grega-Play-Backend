@@ -22,6 +22,9 @@ const supabase = createClient(
 export default async function processVideo(eventId) {
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
 
+  // 🔄 Mettre l'événement en "processing"
+  await supabase.from("events").update({ status: "processing" }).eq("id", eventId);
+
   // 1. Récupérer les vidéos
   console.log("➡️ Étape 1 : Récupération des vidéos depuis Supabase...");
   const { data: videos, error } = await supabase
@@ -39,8 +42,8 @@ export default async function processVideo(eventId) {
   const tempDir = path.join("tmp", eventId);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // 3. Télécharger et tronquer les vidéos à 10s
-  console.log("➡️ Étape 3 : Téléchargement + Tronquage à 10s...");
+  // 3. Télécharger + normaliser vidéos
+  console.log("➡️ Étape 3 : Téléchargement + Normalisation à 15s (H.264/AAC)...");
   const processedPaths = [];
   for (let i = 0; i < videos.length; i++) {
     const { publicUrl } = supabase.storage
@@ -51,45 +54,35 @@ export default async function processVideo(eventId) {
     const localPath = path.join(tempDir, `video${i}_raw.mp4`);
     await downloadFile(publicUrl, localPath);
 
-    // Tronquer à 10s
-    const trimmedPath = path.join(tempDir, `video${i}.mp4`);
-    await trimVideo(localPath, trimmedPath, 10);
-    processedPaths.push(trimmedPath);
+    // Ré-encodage homogène avec SAR/DAR forcés en 9:16 portrait
+    const normalizedPath = path.join(tempDir, `video${i}.mp4`);
+    await normalizeVideo(localPath, normalizedPath, 15); // tronque à 15s
+    processedPaths.push(normalizedPath);
   }
 
-  // 4. Créer list.txt
-  const listPath = path.join(tempDir, "list.txt");
-  const ffmpegList = processedPaths
-    .map((p) => `file '${path.resolve(p).replace(/\\/g, "/")}'`)
-    .join("\n");
-  fs.writeFileSync(listPath, ffmpegList);
-
-  const concatPath = path.join(tempDir, "concat.mp4");
   const outputPath = path.join(tempDir, "final.mp4");
 
-  // 5. Concat
-  await runFFmpegConcat(listPath.replace(/\\/g, "/"), concatPath);
+  // 4. Concat avec filter_complex concat
+  await runFFmpegFilterConcat(processedPaths, outputPath);
 
-  // 6. Copier concat.mp4 → final.mp4
-  fs.copyFileSync(concatPath, outputPath);
-
-  // 7. Upload final.mp4
+  // 5. Upload final.mp4 (overwrite)
   const buffer = fs.readFileSync(outputPath);
-  const supabasePath = `final_videos/${eventId}.mp4`;
+  const supabasePath = `final_videos/${eventId}/final.mp4`;
 
   const { error: uploadError } = await supabase.storage
     .from("videos")
     .upload(supabasePath, buffer, {
       contentType: "video/mp4",
-      upsert: true,
+      upsert: true, // ⚡️ écrase si déjà présent
     });
+
   if (uploadError) throw new Error("Échec de l’upload dans Supabase Storage");
 
   const { publicUrl } = supabase.storage
     .from("videos")
     .getPublicUrl(supabasePath).data;
 
-  // 8. Update event
+  // 6. Update event avec le nouveau lien
   await supabase
     .from("events")
     .update({
@@ -121,33 +114,47 @@ function downloadFile(url, outputPath) {
   });
 }
 
-// ✅ Nouveau helper : tronquer avec FFmpeg
-function trimVideo(inputPath, outputPath, maxSeconds = 10) {
+// ✅ Normalisation en 9:16 portrait
+function normalizeVideo(inputPath, outputPath, maxSeconds = 15) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -i "${inputPath}" -t ${maxSeconds} -c copy "${outputPath}"`;
-    console.log("➡️ FFmpeg trim:", cmd);
+    const cmd = `ffmpeg -y -i "${inputPath}" -t ${maxSeconds} \
+-vf "scale=720:1280,fps=30,setsar=1:1,setdar=9/16" \
+-c:v libx264 -preset fast -crf 23 \
+-c:a aac -b:a 128k -ar 48000 \
+-vsync 2 -async 1 \
+"${outputPath}"`;
+    console.log("➡️ FFmpeg normalize:", cmd);
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
-        console.error("❌ FFmpeg trim error:", stderr || stdout);
-        reject(new Error("Erreur FFmpeg (trim)"));
+        console.error("❌ FFmpeg normalize error:", stderr || stdout);
+        reject(new Error("Erreur FFmpeg (normalize)"));
       } else {
-        console.log("✅ Vidéo tronquée:", outputPath);
+        console.log("✅ Vidéo normalisée:", outputPath);
         resolve();
       }
     });
   });
 }
 
-function runFFmpegConcat(listPath, outputPath) {
+// ✅ Concat avec filter_complex concat
+function runFFmpegFilterConcat(videoPaths, outputPath) {
   return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${outputPath}"`;
-    console.log("➡️ Commande FFmpeg concat:", cmd);
+    const inputs = videoPaths.map(p => `-i "${p}"`).join(" ");
+    const filterInputs = videoPaths.map((_, i) => `[${i}:v:0][${i}:a:0]`).join("");
+    const cmd = `ffmpeg -y ${inputs} \
+-filter_complex "${filterInputs}concat=n=${videoPaths.length}:v=1:a=1[outv][outa]" \
+-map "[outv]" -map "[outa]" \
+-c:v libx264 -preset fast -crf 23 \
+-c:a aac -b:a 128k -ar 48000 \
+"${outputPath}"`;
+
+    console.log("➡️ FFmpeg filter_complex concat:", cmd);
     exec(cmd, (error, stdout, stderr) => {
       if (error) {
         console.error("❌ FFmpeg concat error:", stderr || stdout);
         reject(new Error("Erreur FFmpeg (concat)"));
       } else {
-        console.log("✅ FFmpeg concat terminé");
+        console.log("✅ FFmpeg concat avec filter_complex terminé");
         resolve();
       }
     });
