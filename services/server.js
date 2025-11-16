@@ -8,6 +8,10 @@ import { fileURLToPath } from "url";
 import { exec } from "child_process";
 import util from "util";
 import { createClient } from "@supabase/supabase-js";
+import fetch from "cross-fetch";
+
+global.fetch = fetch;
+
 
 const execAsync = util.promisify(exec);
 const app = express();

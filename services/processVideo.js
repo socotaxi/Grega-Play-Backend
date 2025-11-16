@@ -6,6 +6,10 @@ import https from "https";
 import http from "http";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
+import fetch from "cross-fetch";
+
+global.fetch = fetch;
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
