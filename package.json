@@ -9,6 +9,7 @@
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@supabase/supabase-js": "^2.53.0",
     "cors": "^2.8.5",
+    "cross-fetch": "^4.1.0",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "fluent-ffmpeg": "^2.1.3",
