@@ -33,6 +33,7 @@ const allowedOrigins = [
   "http://127.0.0.1:3000",
   "http://localhost:5173",
   "https://grega-play-frontend.vercel.app",
+  "https://gregaplay.com",
 ];
 app.use(
   cors({
