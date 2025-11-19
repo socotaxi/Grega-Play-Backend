@@ -234,12 +234,15 @@ app.post("/api/videos/process", async (req, res) => {
   try {
     const { default: processVideo } = await import("./processVideo.js");
     const finalVideoUrl = await processVideo(eventId);
-    res.status(200).json({ videoUrl: finalVideoUrl });
+    return res.status(200).json({ finalVideoUrl: finalVideoUrl });
   } catch (err) {
     console.error("❌ Erreur génération vidéo finale :", err);
-    res.status(500).json({ error: "Erreur lors de la génération de la vidéo finale" });
+    return res.status(500).json({
+      error: err.message || "Erreur lors de la génération de la vidéo finale",
+    });
   }
 });
+
 
 // ======================================================
 // 🚀 Lancement serveur
