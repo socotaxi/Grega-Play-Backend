@@ -24,3 +24,9 @@ EXPOSE 8080
 
 # Lancer le serveur
 CMD ["npm", "start"]
+
+# Créer le dossier assets dans l'image Docker
+RUN mkdir -p /app/assets
+
+# Copier le dossier assets dans l'image
+COPY assets/ /app/assets/

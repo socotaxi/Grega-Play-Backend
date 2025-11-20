@@ -70,7 +70,7 @@ export default async function processVideo(eventId) {
       return (async () => {
         console.log(`⬇️ Téléchargement (batch) : ${publicUrl}`);
         await downloadFile(publicUrl, localPath);
-        await normalizeVideo(localPath, normalizedPath, 15);
+        await normalizeVideo(localPath, normalizedPath, 30);
         processedPaths.push(normalizedPath);
       })();
     });
@@ -82,6 +82,22 @@ export default async function processVideo(eventId) {
 
   // 4. Concat avec fallback audio
   await runFFmpegFilterConcat(processedPaths, outputPath);
+
+  // 4.1 Appliquer le filigrane sur la vidéo concaténée (avec fallback si ça plante)
+  const noWmPath = path.join(tempDir, "final_no_wm.mp4");
+  fs.renameSync(outputPath, noWmPath);
+
+  try {
+    await applyWatermark(noWmPath, outputPath);
+  } catch (e) {
+    console.error("⚠️ Erreur lors de l'application du watermark, on garde la vidéo sans filigrane.");
+    console.error(e);
+
+    // Si final.mp4 n'existe pas (échec du watermark), on revient au fichier sans watermark
+    if (!fs.existsSync(outputPath) && fs.existsSync(noWmPath)) {
+      fs.renameSync(noWmPath, outputPath);
+    }
+  }
 
   // 5. Upload final.mp4 (overwrite)
   const buffer = fs.readFileSync(outputPath);
@@ -183,8 +199,8 @@ function runFFmpegFilterConcat(videoPaths, outputPath) {
     exec(cmdWithAudio, (error, stdout, stderr) => {
       if (!error) {
         console.log("✅ FFmpeg concat terminé (avec audio)");
-        return resolve();
       }
+      if (!error) return resolve();
 
       console.error("❌ FFmpeg concat avec audio a échoué, on tente sans audio.");
       console.error("   Détails:", stderr || stdout);
@@ -210,6 +226,38 @@ function runFFmpegFilterConcat(videoPaths, outputPath) {
           return resolve();
         }
       });
+    });
+  });
+}
+
+// 🔥 Appliquer un filigrane sur la vidéo finale
+function applyWatermark(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const watermarkPath = path.join(__dirname, "assets", "watermark.png");
+
+    // ✅ Sécuriser : si le fichier watermark n'existe pas, on skip proprement
+    if (!fs.existsSync(watermarkPath)) {
+      console.warn("⚠️ Watermark introuvable, on génère la vidéo sans filigrane.");
+      // On recopie simplement la vidéo d'entrée vers la sortie
+      fs.copyFileSync(inputPath, outputPath);
+      return resolve();
+    }
+
+    const cmd = `ffmpeg -y -i "${inputPath}" -i "${watermarkPath}" \
+-filter_complex "overlay=main_w-overlay_w-30:main_h-overlay_h-30" \
+-c:v libx264 -preset veryfast -crf 23 \
+-movflags +faststart "${outputPath}"`;
+
+    console.log("➡️ FFmpeg watermark:", cmd);
+
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ FFmpeg watermark error:", stderr || stdout);
+        return reject(new Error("Erreur FFmpeg (watermark)"));
+      } else {
+        console.log("✅ Watermark appliqué :", outputPath);
+        return resolve();
+      }
     });
   });
 }
