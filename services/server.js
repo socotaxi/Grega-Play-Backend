@@ -9,6 +9,8 @@ import { exec } from "child_process";
 import util from "util";
 import { createClient } from "@supabase/supabase-js";
 import fetch from "cross-fetch";
+import notificationsRouter from "../routes/notifications.js";
+import { sendPushNotification } from "./pushService.js"; // 🔔 envoi des push
 
 // ⚠️ Supabase client utilisé dans cette fonction sera défini plus bas
 async function logRejectedUpload({
@@ -189,6 +191,179 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 );
 
+// 🔔 Notifs : helper quand une nouvelle vidéo est envoyée (créateur uniquement)
+async function notifyEventOwnerOnNewVideo(eventId, participantName) {
+  try {
+    const { data: events, error: eventError } = await supabase
+      .from("events")
+      .select("user_id, title, enable_notifications") // prise en compte du toggle
+      .eq("id", eventId)
+      .limit(1);
+
+    if (eventError || !events || events.length === 0) {
+      console.warn(
+        "⚠️ Impossible de récupérer l'événement pour la notif (nouvelle vidéo):",
+        eventError
+      );
+      return;
+    }
+
+    const event = events[0];
+
+    // respect du choix du créateur
+    if (event.enable_notifications === false) {
+      console.log(
+        `ℹ️ Notifications désactivées pour l'événement ${eventId} (nouvelle vidéo), aucun envoi.`
+      );
+      return;
+    }
+
+    const { data: subs, error: subsError } = await supabase
+      .from("notification_subscriptions")
+      .select("*")
+      .eq("user_id", event.user_id);
+
+    if (subsError || !subs || subs.length === 0) {
+      console.log(
+        "ℹ️ Aucun abonnement push pour ce créateur (nouvelle vidéo), aucun envoi."
+      );
+      return;
+    }
+
+    const payload = {
+      title: "Nouvelle vidéo reçue 🎬",
+      body: `${participantName} a envoyé une vidéo pour l'événement "${event.title}".`,
+      url: `https://gregaplay.com/dashboard`,
+    };
+
+    for (const sub of subs) {
+      const subscription = {
+        endpoint: sub.endpoint,
+        keys: {
+          p256dh: sub.p256dh,
+          auth: sub.auth,
+        },
+      };
+
+      try {
+        await sendPushNotification(subscription, payload);
+      } catch (err) {
+        console.error("❌ Erreur envoi push (nouvelle vidéo):", err);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Erreur notifyEventOwnerOnNewVideo:", err);
+  }
+}
+
+// 🔔 Notifs : helper quand la vidéo finale est prête (créateur + invités)
+async function notifyEventUsersOnFinalVideo(eventId, finalVideoUrl) {
+  try {
+    // 1) Récupérer l'événement (créateur + titre + choix notifs)
+    const { data: events, error: eventError } = await supabase
+      .from("events")
+      .select("id, user_id, title, enable_notifications")
+      .eq("id", eventId)
+      .limit(1);
+
+    if (eventError || !events || events.length === 0) {
+      console.warn(
+        "⚠️ Impossible de récupérer l'événement pour la notif (vidéo finale):",
+        eventError
+      );
+      return;
+    }
+
+    const event = events[0];
+
+    // notifications désactivées pour cet event
+    if (event.enable_notifications === false) {
+      console.log(
+        `ℹ️ Notifications désactivées pour l'événement ${eventId} (vidéo finale), aucun envoi.`
+      );
+      return;
+    }
+
+    // 2) Récupérer les invités (participants) de l'événement
+    // adapte "event_participants" + colonnes si besoin
+    const { data: participants, error: participantsError } = await supabase
+      .from("event_participants")
+      .select("user_id")
+      .eq("event_id", eventId)
+      .eq("status", "accepted");
+
+    if (participantsError) {
+      console.error(
+        "❌ Erreur récupération participants pour notif vidéo finale:",
+        participantsError
+      );
+    }
+
+    const participantUserIds = (participants || []).map((p) => p.user_id);
+
+    // 3) Construire la liste de tous les user_ids à notifier (créateur + invités)
+    const allUserIds = Array.from(
+      new Set([event.user_id, ...participantUserIds])
+    );
+
+    if (allUserIds.length === 0) {
+      console.log(
+        "ℹ️ Aucun utilisateur à notifier pour cette vidéo finale (liste userIds vide)."
+      );
+      return;
+    }
+
+    // 4) Récupérer toutes les subscriptions de ces users
+    const { data: subs, error: subsError } = await supabase
+      .from("notification_subscriptions")
+      .select("*")
+      .in("user_id", allUserIds);
+
+    if (subsError || !subs || subs.length === 0) {
+      console.log(
+        "ℹ️ Aucun abonnement push trouvé pour ces utilisateurs (vidéo finale)."
+      );
+      return;
+    }
+
+    // 5) Envoyer la notif adaptée à chacun
+    for (const sub of subs) {
+      const isOwner = sub.user_id === event.user_id;
+
+      const payload = isOwner
+        ? {
+            title: "Ta vidéo finale est prête 🎉",
+            body: `La vidéo finale de l'événement "${event.title}" est maintenant disponible.`,
+            url: finalVideoUrl || "https://gregaplay.com/dashboard",
+          }
+        : {
+            title: "La vidéo finale est prête 🎉",
+            body: `La vidéo finale de l'événement "${event.title}" est prête. Le créateur pourra te la partager bientôt.`,
+            url: "https://gregaplay.com/dashboard",
+          };
+
+      const subscription = {
+        endpoint: sub.endpoint,
+        keys: {
+          p256dh: sub.p256dh,
+          auth: sub.auth,
+        },
+      };
+
+      try {
+        await sendPushNotification(subscription, payload);
+      } catch (err) {
+        console.error("❌ Erreur envoi push (vidéo finale - user):", err);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Erreur notifyEventUsersOnFinalVideo:", err);
+  }
+}
+
+// Routes notifications (pas protégées par x-api-key)
+app.use("/api/notifications", notificationsRouter);
+
 // ======================================================
 // 🚑 Route de test
 // ======================================================
@@ -336,6 +511,11 @@ app.post(
       fs.unlinkSync(compressedPath);
       fs.unlinkSync(file.path);
 
+      // 🔔 Notifier le créateur de l'évènement (nouvelle vidéo)
+      notifyEventOwnerOnNewVideo(eventId, participantName).catch((err) =>
+        console.error("❌ Erreur notif nouvelle vidéo:", err)
+      );
+
       res.status(200).json(insertData[0]);
     } catch (err) {
       console.error("❌ Erreur upload vidéo :", err);
@@ -396,6 +576,12 @@ app.post("/api/videos/process", async (req, res) => {
   try {
     const { default: processVideo } = await import("./processVideo.js");
     const finalVideoUrl = await processVideo(eventId);
+
+    // 🔔 Notifier le créateur + les invités quand la vidéo finale est prête
+    notifyEventUsersOnFinalVideo(eventId, finalVideoUrl).catch((err) =>
+      console.error("❌ Erreur notif vidéo finale:", err)
+    );
+
     return res.status(200).json({ finalVideoUrl: finalVideoUrl });
   } catch (err) {
     console.error("❌ Erreur génération vidéo finale :", err);
