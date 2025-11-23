@@ -11,6 +11,7 @@ import { createClient } from "@supabase/supabase-js";
 import fetch from "cross-fetch";
 import notificationsRouter from "../routes/notifications.js";
 import { sendPushNotification } from "./pushService.js"; // 🔔 envoi des push
+import emailRoutes from "../routes/emailRoutes.js"; // 📧 routes email backend
 
 // ⚠️ Supabase client utilisé dans cette fonction sera défini plus bas
 async function logRejectedUpload({
@@ -285,7 +286,6 @@ async function notifyEventUsersOnFinalVideo(eventId, finalVideoUrl) {
     }
 
     // 2) Récupérer les invités (participants) de l'événement
-    // adapte "event_participants" + colonnes si besoin
     const { data: participants, error: participantsError } = await supabase
       .from("event_participants")
       .select("user_id")
@@ -385,6 +385,9 @@ async function getVideoDuration(filePath) {
 // ======================================================
 // 🔒 Toutes les routes /api doivent avoir x-api-key
 app.use("/api", apiKeyMiddleware);
+
+// 📧 Routes email (protégées par x-api-key)
+app.use("/api/email", emailRoutes);
 
 app.post(
   "/api/videos/upload-and-compress",
