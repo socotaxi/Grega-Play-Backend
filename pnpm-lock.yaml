@@ -44,13 +44,13 @@ importers:
       uuid:
         specifier: ^9.0.1
         version: 9.0.1
-      web-push:
-        specifier: ^3.6.7
-        version: 3.6.7
     devDependencies:
       nodemon:
         specifier: ^3.1.11
         version: 3.1.11
+      web-push:
+        specifier: ^3.6.7
+        version: 3.6.7
 
 packages:
 
