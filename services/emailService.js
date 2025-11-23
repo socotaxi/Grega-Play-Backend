@@ -1,70 +1,76 @@
 // services/emailService.js
-import nodemailer from "nodemailer";
+import sgMail from "@sendgrid/mail";
 
 const {
-  SMTP_HOST,
-  SMTP_PORT,
-  SMTP_SECURE,
-  SMTP_USER,
-  SMTP_PASS,
-  SMTP_FROM,
+  SENDGRID_API_KEY,
+  SENDGRID_FROM_EMAIL,
+  SENDGRID_FROM_NAME,
 } = process.env;
 
-// Debug visible au démarrage
-console.log("📨 SMTP config chargée:", {
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: SMTP_SECURE,
-  user: SMTP_USER,
-  from: SMTP_FROM,
-  passLength: SMTP_PASS ? SMTP_PASS.length : 0,
+const hasSendgrid = !!SENDGRID_API_KEY && !!SENDGRID_FROM_EMAIL;
+
+console.log("📨 SendGrid config chargée:", {
+  hasApiKey: !!SENDGRID_API_KEY,
+  fromEmail: SENDGRID_FROM_EMAIL,
+  fromName: SENDGRID_FROM_NAME,
 });
 
-// Configuration SendGrid SMTP
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST || "smtp.sendgrid.net",
-  port: Number(SMTP_PORT) || 587,
-  secure: SMTP_SECURE === "true", // false pour port 587
-  auth: {
-    user: SMTP_USER, // doit être "apikey"
-    pass: SMTP_PASS, // ta clé API SendGrid
-  },
-});
-
-// Vérification au démarrage
-transporter.verify((error, success) => {
-  if (error) {
-    console.error("❌ Vérification SMTP échouée:", error.message);
-  } else {
-    console.log("✅ Connexion SMTP OK, prêt à envoyer des emails.");
-  }
-});
+if (hasSendgrid) {
+  sgMail.setApiKey(SENDGRID_API_KEY);
+} else {
+  console.warn(
+    "⚠️ SendGrid non configuré (SENDGRID_API_KEY ou SENDGRID_FROM_EMAIL manquant). " +
+    "Les emails ne seront pas envoyés, mais le backend reste en ligne."
+  );
+}
 
 /**
- * Email générique
+ * Envoi générique d'email via SendGrid
  */
 async function sendMail({ to, subject, html, text }) {
-  const mailOptions = {
-    from: SMTP_FROM || "Grega Play <noreply@gregaplay.com>",
+  if (!hasSendgrid) {
+    console.warn(
+      "⏭️ Email ignoré (SendGrid non configuré) ->",
+      subject,
+      "->",
+      to
+    );
+    return;
+  }
+
+  const fromName = SENDGRID_FROM_NAME || "Grega Play";
+
+  const msg = {
     to,
+    from: {
+      email: SENDGRID_FROM_EMAIL,
+      name: fromName,
+    },
     subject,
     text,
     html,
   };
 
-  const info = await transporter.sendMail(mailOptions);
-  console.log("📧 Email envoyé →", to, "messageId:", info.messageId);
-  return info;
+  try {
+    const [response] = await sgMail.send(msg);
+    console.log(
+      "📧 Email envoyé via SendGrid →",
+      to,
+      "statusCode:",
+      response?.statusCode
+    );
+    return response;
+  } catch (error) {
+    console.error("❌ Erreur SendGrid lors de l'envoi d'email:", error.message);
+    if (error.response) {
+      console.error("📩 Détails SendGrid:", error.response.body);
+    }
+    // On nève PAS d'erreur ici pour ne pas faire crasher le serveur
+  }
 }
 
 /**
- * Email d'invitation
- * On garde la compatibilité avec l’appel existant
- * et on ajoute des champs optionnels :
- * - eventDescription
- * - deadline (déjà formatée côté appelant si tu veux)
- * - eventThumbnailUrl
- * - personalMessage
+ * Email d'invitation à un événement Grega Play
  */
 async function sendInvitationEmail({
   to,
