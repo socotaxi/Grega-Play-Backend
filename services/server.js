@@ -102,6 +102,7 @@ process.on("SIGTERM", () => {
 // 🌍 Config CORS
 const allowedOrigins = [
   "http://127.0.0.1:3000",
+  "http://localhost:3000", 
   "http://localhost:5173",
   "https://grega-play-frontend.vercel.app",
   "https://gregaplay.com",
@@ -369,6 +370,54 @@ app.use("/api/notifications", notificationsRouter);
 // ======================================================
 app.get("/ping", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// ======================================================
+// ✅ Route publique pour la vidéo finale (lien propre)
+// ======================================================
+app.get("/api/public/final-video/:publicCode", async (req, res) => {
+  try {
+    const { publicCode } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select(
+        `
+        id,
+        title,
+        description,
+        theme,
+        deadline,
+        final_video_url,
+        status,
+        user_id
+      `
+      )
+      .eq("public_code", publicCode)
+      .single();
+
+    if (error || !event) {
+      console.error("❌ Événement introuvable pour public_code:", publicCode, error);
+      return res.status(404).json({ message: "Événement introuvable" });
+    }
+
+    if (!event.final_video_url) {
+      return res
+        .status(400)
+        .json({ message: "La vidéo finale n’est pas encore disponible." });
+    }
+
+    return res.json({
+      title: event.title,
+      description: event.description,
+      theme: event.theme,
+      deadline: event.deadline,
+      finalVideoUrl: event.final_video_url,
+    });
+  } catch (err) {
+    console.error("❌ Erreur route /api/public/final-video :", err);
+    return res.status(500).json({ message: "Erreur serveur" });
+  }
 });
 
 // ======================================================
