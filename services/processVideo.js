@@ -22,24 +22,39 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-export default async function processVideo(eventId) {
+export default async function processVideo(eventId, selectedVideoIds) {
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
 
   // 🔄 Mettre l'événement en "processing"
   await supabase.from("events").update({ status: "processing" }).eq("id", eventId);
 
-  // 1. Récupérer les vidéos
-  console.log("➡️ Étape 1 : Récupération des vidéos depuis Supabase...");
+  if (!Array.isArray(selectedVideoIds) || selectedVideoIds.length < 2) {
+    throw new Error("Au moins 2 vidéos doivent être sélectionnées pour le montage.");
+  }
+
+  // 1. Récupérer les vidéos sélectionnées
+  console.log("➡️ Étape 1 : Récupération des vidéos sélectionnées depuis Supabase...");
   const { data: videos, error } = await supabase
     .from("videos")
-    .select("storage_path")
-    .eq("event_id", eventId);
+    .select("id, storage_path")
+    .eq("event_id", eventId)
+    .in("id", selectedVideoIds);
 
-  if (error) throw new Error("Impossible de récupérer les vidéos");
+  if (error) throw new Error("Impossible de récupérer les vidéos sélectionnées");
   if (!videos || videos.length === 0) {
     throw new Error("Aucune vidéo trouvée pour cet événement.");
   }
-  console.log(`✅ ${videos.length} vidéos trouvées.`);
+
+  // Réordonner pour respecter l'ordre de sélection
+  const orderedVideos = selectedVideoIds
+    .map((id) => videos.find((v) => v.id === id))
+    .filter(Boolean);
+
+  if (!orderedVideos.length) {
+    throw new Error("Impossible de faire correspondre les vidéos sélectionnées.");
+  }
+
+  console.log(`✅ ${orderedVideos.length} vidéos sélectionnées pour le montage.`);
 
   // 2. Préparer temp dir (même dossier tmp que server.js)
   const tempRoot = path.join(__dirname, "tmp");
@@ -55,8 +70,8 @@ export default async function processVideo(eventId) {
 
   const CONCURRENCY = 2;
 
-  for (let i = 0; i < videos.length; i += CONCURRENCY) {
-    const slice = videos.slice(i, i + CONCURRENCY);
+  for (let i = 0; i < orderedVideos.length; i += CONCURRENCY) {
+    const slice = orderedVideos.slice(i, i + CONCURRENCY);
 
     const batchPromises = slice.map((video, idx) => {
       const globalIndex = i + idx;
@@ -149,7 +164,7 @@ function downloadFile(url, outputPath) {
 }
 
 // ✅ Normalisation optimisée en 9:16 portrait
-function normalizeVideo(inputPath, outputPath, maxSeconds = 15) {
+function normalizeVideo(inputPath, outputPath, maxSeconds = 30) {
   return new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -i "${inputPath}" -t ${maxSeconds} \
 -vf "scale=576:1024:flags=bicubic,fps=25,setsar=1:1,setdar=9/16" \

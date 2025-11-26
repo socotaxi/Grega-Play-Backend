@@ -12,6 +12,7 @@ import fetch from "cross-fetch";
 import notificationsRouter from "../routes/notifications.js";
 import { sendPushNotification } from "./pushService.js"; // 🔔 envoi des push
 import emailRoutes from "../routes/emailRoutes.js"; // 📧 routes email backend
+import whatsappAuthRoutes from "../routes/whatsappAuthRoutes.js"; // 📱 login téléphone / WhatsApp
 
 // ⚠️ Supabase client utilisé dans cette fonction sera défini plus bas
 async function logRejectedUpload({
@@ -102,7 +103,7 @@ process.on("SIGTERM", () => {
 // 🌍 Config CORS
 const allowedOrigins = [
   "http://127.0.0.1:3000",
-  "http://localhost:3000", 
+  "http://localhost:3000",
   "http://localhost:5173",
   "https://grega-play-frontend.vercel.app",
   "https://gregaplay.com",
@@ -430,6 +431,11 @@ async function getVideoDuration(filePath) {
 }
 
 // ======================================================
+// 📱 Routes OTP WhatsApp (publiques, pas de x-api-key)
+// ======================================================
+app.use("/auth", whatsappAuthRoutes);
+
+// ======================================================
 // ✅ Upload + compression vidéo avec limite 30s
 // ======================================================
 // 🔒 Toutes les routes /api doivent avoir x-api-key
@@ -618,16 +624,34 @@ app.delete("/api/videos/:id", async (req, res) => {
 });
 
 // ======================================================
-// ✅ Générer la vidéo finale
+// ✅ Générer la vidéo finale (avec sélection 2–5 vidéos)
 // ======================================================
 app.post("/api/videos/process", async (req, res) => {
-  const { eventId } = req.body;
+  const { eventId, selectedVideoIds } = req.body;
+
   if (!eventId) {
     return res.status(400).json({ error: "eventId manquant" });
   }
+
+  // Règle gratuite : 2 à 5 vidéos sélectionnées
+  if (!Array.isArray(selectedVideoIds) || selectedVideoIds.length < 2) {
+    return res.status(400).json({
+      error: "Sélectionne au moins 2 vidéos pour générer la vidéo finale.",
+    });
+  }
+
+  const isPremium = false; // sera branché plus tard sur un vrai statut Premium
+
+  if (!isPremium && selectedVideoIds.length > 5) {
+    return res.status(400).json({
+      error:
+        "La version gratuite permet d'utiliser au maximum 5 vidéos. Passe à un compte Premium pour en utiliser davantage.",
+    });
+  }
+
   try {
     const { default: processVideo } = await import("./processVideo.js");
-    const finalVideoUrl = await processVideo(eventId);
+    const finalVideoUrl = await processVideo(eventId, selectedVideoIds);
 
     // 🔔 Notifier le créateur + les invités quand la vidéo finale est prête
     notifyEventUsersOnFinalVideo(eventId, finalVideoUrl).catch((err) =>

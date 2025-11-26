@@ -75,7 +75,7 @@ async function sendMail({ to, subject, html, text }) {
 }
 
 /**
- * Email d'invitation à un événement Grega Play (version design + logo)
+ * Email d'invitation à un événement Grega Play (version premium)
  */
 async function sendInvitationEmail({
   to,
@@ -90,145 +90,184 @@ async function sendInvitationEmail({
   const safeOrganizerName = inviterName || "L'organisateur";
   const safeEventTitle = eventTitle || "un événement vidéo collaboratif";
 
-  const subject = `Invitation à l'événement "${safeEventTitle}"`;
+  // LOG DE VERSION POUR DEBUG
+  console.log(
+    "📨 [GregaPlay] sendInvitationEmail PREMIUM v2 utilisé pour:",
+    to,
+    "| event:",
+    safeEventTitle
+  );
 
+  // Sujet modifié pour être sûr de voir la nouvelle version
+  const subject = `Grega Play – Invitation à "${safeEventTitle}" (v2)`;
+
+  // Logo : priorité à la variable d'env, sinon logo par défaut
   const logoUrl =
     GREGAPLAY_LOGO_URL ||
-    "https://via.placeholder.com/240x80?text=Grega+Play"; // Fallback si pas de logo configuré
+    "https://cgqnrqbyvetcgwolkjvl.supabase.co/storage/v1/object/public/gregaplay-assets/logo.png";
 
+  // Version texte (utile pour éviter le spam & clients texte-only)
+  const text = `
+${safeOrganizerName} vous invite à participer à un événement sur Grega Play : "${safeEventTitle}".
+
+${eventDescription ? "À propos de l’événement :\n" + eventDescription.slice(0, 300) + (eventDescription.length > 300 ? "..." : "") : ""}
+
+Date limite pour envoyer votre vidéo : ${deadline || "non précisée"}
+
+Pour rejoindre l'événement, ouvrez ce lien :
+${eventLink}
+
+Vous recevez cet email parce que ${safeOrganizerName} a saisi votre adresse sur Grega Play pour vous inviter à participer à ce montage vidéo collaboratif.
+`.trim();
+
+  // Template HTML PREMIUM
   const html = `
-    <div style="font-family: Arial, sans-serif; background:#f6f9fc; padding:24px;">
-      <div style="
-        max-width:520px;
-        margin:auto;
-        background:#ffffff;
-        border-radius:12px;
-        box-shadow:0 6px 20px rgba(0,0,0,0.08);
-        overflow:hidden;
-      ">
-        <!-- HEADER AVEC LOGO -->
-        <div style="background:#111827; padding:24px; text-align:center;">
-          <img src="${logoUrl}" alt="Grega Play"
-            style="width:140px; height:auto; display:block; margin:auto;" />
+  <div style="font-family: Inter, Arial, sans-serif; background:#f4f6f9; padding:32px;">
+    <div style="
+      max-width:600px;
+      margin:auto;
+      background:#ffffff;
+      border-radius:18px;
+      overflow:hidden;
+      box-shadow:0 10px 35px rgba(0,0,0,0.12);
+    ">
+
+      <!-- HEADER AVEC LOGO -->
+      <div style="background:#0f172a; padding:32px 24px; text-align:center;">
+        <img src="${logoUrl}"
+             alt="Grega Play"
+             style="width:180px; height:auto; display:block; margin:auto;" />
+        <p style="color:#e2e8f0; font-size:14px; margin-top:12px; opacity:0.8;">
+          Montage vidéo collaboratif – Simple, rapide, puissant
+        </p>
+      </div>
+
+      <div style="padding:32px;">
+
+        <!-- TITRE -->
+        <h1 style="
+          margin:0;
+          font-size:26px;
+          color:#0f172a;
+          text-align:center;
+          line-height:1.3;
+        ">
+           Invitation à l’événement : <br/>
+          <span style="color:#16a34a;">${safeEventTitle}</span>
+        </h1>
+
+        <!-- ORGANISATEUR -->
+        <p style="text-align:center; margin-top:10px; font-size:15px; color:#334155;">
+          Organisé par : <strong>${safeOrganizerName}</strong>
+        </p>
+
+        <!-- MINIATURE -->
+        ${
+          eventThumbnailUrl
+            ? `
+        <div style="text-align:center; margin:28px 0;">
+          <img src="${eventThumbnailUrl}"
+               alt="Image de l'événement"
+               style="
+                 width:100%;
+                 max-width:480px;
+                 border-radius:14px;
+                 box-shadow:0 6px 18px rgba(0,0,0,0.15);
+               "/>
         </div>
+        `
+            : ""
+        }
 
-        <!-- CONTENU -->
-        <div style="padding: 28px; color:#333; line-height:1.6;">
+        <!-- DESCRIPTION -->
+        ${
+          eventDescription
+            ? `
+        <p style="margin:12px 0; font-size:15px; color:#475569; line-height:1.6;">
+          <strong>À propos de l’événement :</strong><br/>
+          ${eventDescription.slice(0, 300)}${eventDescription.length > 300 ? "..." : ""}
+        </p>
+        `
+            : ""
+        }
 
-          <p style="font-size:15px; margin:0 0 10px;">
-            Bonjour,
-          </p>
+        ${
+          deadline
+            ? `
+        <p style="margin-top:14px; font-size:14px; color:#334155;">
+          <strong>Date limite pour envoyer votre vidéo :</strong><br/>
+          <span style="color:#dc2626;">${deadline}</span>
+        </p>
+        `
+            : ""
+        }
 
-          <p style="font-size:15px; margin:0 0 14px;">
-            <strong>${safeOrganizerName}</strong> vous invite à participer à un montage vidéo collaboratif avec
-            <strong style="color:#4CAF50;">Grega Play</strong>.
-          </p>
-
-          <!-- TITRE DE L'ÉVÉNEMENT -->
-          <h2 style="
-            text-align:center;
-            color:#111827;
-            margin:20px 0 14px;
-            font-size:22px;
-          ">
-             ${safeEventTitle}
-          </h2>
-
-          ${
-            eventThumbnailUrl
-              ? `
-          <!-- MINIATURE (optionnelle) -->
-          <div style="text-align:center; margin-bottom:20px;">
-            <img src="${eventThumbnailUrl}" alt="Miniature de l'événement ${safeEventTitle}"
-              style="width:100%; max-width:420px; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.15);" />
-          </div>
-          `
-              : ""
-          }
-
-          ${
-            eventDescription
-              ? `
-          <!-- DESCRIPTION -->
-          <p style="margin-top:10px; font-size:14px;">
-            <strong>Description :</strong><br/>
-            ${eventDescription}
-          </p>
-          `
-              : ""
-          }
-
-          ${
-            deadline
-              ? `
-          <!-- DEADLINE -->
-          <p style="margin-top:10px; font-size:14px;">
-            <strong>Date limite :</strong> ${deadline}
-          </p>
-          `
-              : ""
-          }
-
-          ${
-            personalMessage
-              ? `
-          <!-- MESSAGE PERSONNEL -->
-          <div style="margin-top:16px; padding:14px 18px; background:#f4f4f4; border-left:4px solid #4CAF50; border-radius:6px;">
-            <p style="margin:0; font-size:14px;">
-              <em>Message de ${safeOrganizerName} :</em><br/>
-              ${personalMessage}
-            </p>
-          </div>
-          `
-              : ""
-          }
-
-          <!-- ÉTAPES -->
-          <p style="margin-top:18px; font-size:14px;">🎯 <strong>Comment participer ?</strong></p>
-          <ul style="padding-left:18px; font-size:14px; margin-top:8px;">
-            <li>Cliquez sur le bouton ci-dessous pour rejoindre l’événement</li>
-            <li>Créez votre compte Grega Play (si ce n’est pas déjà fait)</li>
-            <li>Enregistrez ou téléchargez votre vidéo avant la date limite</li>
-            <li>Profitez du montage final créé automatiquement 🎬</li>
-          </ul>
-
-          <!-- BOUTON PRINCIPAL -->
-          <div style="text-align:center; margin:26px 0 18px;">
-            <a href="${eventLink}"
-              style="
-                display:inline-block;
-                padding:14px 28px;
-                background:#4CAF50;
-                color:#ffffff;
-                font-weight:bold;
-                font-size:15px;
-                border-radius:8px;
-                text-decoration:none;
-                box-shadow:0 3px 8px rgba(0,0,0,0.15);
-              "
-              target="_blank"
-            >
-              👉 Rejoindre l’événement
-            </a>
-          </div>
-
-          <!-- LIEN TEXTE -->
-          <p style="font-size:12px; color:#666; text-align:center; margin-top:0;">
-            Si le bouton ne fonctionne pas, ouvrez ce lien dans votre navigateur :<br/>
-            <a href="${eventLink}" style="color:#4CAF50;" target="_blank">${eventLink}</a>
+        <!-- MESSAGE PERSONNEL -->
+        ${
+          personalMessage
+            ? `
+        <div style="margin-top:22px; padding:18px 22px; background:#f1f5f9; border-left:5px solid #16a34a; border-radius:10px;">
+          <p style="margin:0; font-size:14px; color:#334155;">
+            <strong>Message de ${safeOrganizerName} :</strong><br/>
+            <em>${personalMessage}</em>
           </p>
         </div>
+        `
+            : ""
+        }
 
-        <!-- FOOTER -->
-        <div style="background:#f1f5f9; padding:16px; text-align:center; font-size:12px; color:#777;">
-          Grega Play – Créez des moments qui rassemblent.<br/>
-          © 2025 Grega Play, tous droits réservés.
+        <!-- COMMENT PARTICIPER -->
+        <h3 style="margin-top:30px; font-size:18px; color:#0f172a;">
+          🎯 Comment participer ?
+        </h3>
+
+        <ul style="font-size:15px; color:#475569; padding-left:20px; line-height:1.7;">
+          <li>Cliquez sur le bouton ci-dessous</li>
+          <li>Créez votre compte Grega Play ou connectez-vous</li>
+          <li>Enregistrez ou téléchargez une vidéo (max 30 sec)</li>
+          <li>Recevez automatiquement le montage final 🎬</li>
+        </ul>
+
+        <!-- CTA -->
+        <div style="text-align:center; margin:36px 0 24px;">
+          <a href="${eventLink}"
+             style="
+               background:linear-gradient(135deg, #16a34a, #059669);
+               padding:16px 36px;
+               display:inline-block;
+               font-size:16px;
+               font-weight:bold;
+               color:#ffffff;
+               border-radius:12px;
+               text-decoration:none;
+               box-shadow:0 6px 18px rgba(0,0,0,0.20);
+             "
+             target="_blank"
+          >
+            👉 Rejoindre l’événement
+          </a>
         </div>
+
+        <!-- LIEN TEXTE -->
+        <p style="font-size:12px; text-align:center; color:#64748b;">
+          Si le bouton ne fonctionne pas, ouvrez ce lien :<br/>
+          <a href="${eventLink}" style="color:#16a34a;">${eventLink}</a>
+        </p>
+      </div>
+
+      <!-- FOOTER -->
+      <div style="background:#f8fafc; padding:18px; text-align:center; font-size:12px; color:#64748b;">
+        Grega Play – L’émotion se construit ensemble<br/>
+        <span style="font-size:11px; color:#94a3b8;">
+          Version template: PREMIUM-v2
+        </span><br/>
+        © 2025 Grega Play
       </div>
     </div>
-  `;
+  </div>
+`;
 
-  return sendMail({ to, subject, html });
+  return sendMail({ to, subject, html, text });
 }
 
 export default {
