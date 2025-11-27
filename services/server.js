@@ -398,7 +398,11 @@ app.get("/api/public/final-video/:publicCode", async (req, res) => {
       .single();
 
     if (error || !event) {
-      console.error("❌ Événement introuvable pour public_code:", publicCode, error);
+      console.error(
+        "❌ Événement introuvable pour public_code:",
+        publicCode,
+        error
+      );
       return res.status(404).json({ message: "Événement introuvable" });
     }
 
@@ -498,6 +502,45 @@ app.post(
 
       return res.status(400).json({
         error: "Type de fichier non autorisé. Formats acceptés : MP4, MOV.",
+      });
+    }
+
+    // 🔒 Contrôle : 1 seule vidéo par participant sur compte gratuit
+    try {
+      const { data: existingVideos, error: existingError } = await supabase
+        .from("videos")
+        .select("id")
+        .eq("event_id", eventId)
+        .eq("participant_name", participantName);
+
+      if (existingError) {
+        console.error("❌ Erreur contrôle quota vidéos:", existingError);
+        return res.status(500).json({
+          error: "Erreur interne lors du contrôle du quota.",
+        });
+      }
+
+      const isPremium = false; // sera branché plus tard sur un vrai statut Premium
+
+      if (!isPremium && existingVideos && existingVideos.length >= 1) {
+        await logRejectedUpload({
+          req,
+          reason: "quota_free_max_1_video",
+          file,
+          eventId,
+          participantName,
+        });
+
+        return res.status(403).json({
+          error: "MAX_FREE_VIDEOS_PER_EVENT_REACHED",
+          message:
+            "Avec un compte gratuit, tu peux envoyer une seule vidéo par événement. Passe en Premium pour en ajouter d'autres.",
+        });
+      }
+    } catch (err) {
+      console.error("❌ Erreur inattendue contrôle quota:", err);
+      return res.status(500).json({
+        error: "Erreur interne lors du contrôle du quota.",
       });
     }
 
