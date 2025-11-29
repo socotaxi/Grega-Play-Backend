@@ -13,6 +13,7 @@ import notificationsRouter from "../routes/notifications.js";
 import { sendPushNotification } from "./pushService.js"; // 🔔 envoi des push
 import emailRoutes from "../routes/emailRoutes.js"; // 📧 routes email backend
 import whatsappAuthRoutes from "../routes/whatsappAuthRoutes.js"; // 📱 login téléphone / WhatsApp
+import emailService from "./emailService.js"; // ✅ nécessaire pour /api/events/:eventId/remind
 
 // ⚠️ Supabase client utilisé dans cette fonction sera défini plus bas
 async function logRejectedUpload({
@@ -707,6 +708,195 @@ app.post("/api/videos/process", async (req, res) => {
     return res.status(500).json({
       error: err.message || "Erreur lors de la génération de la vidéo finale",
     });
+  }
+});
+
+// ======================================================
+// ✅ Statistiques par événement (invitations / vidéos)
+// ======================================================
+app.get("/api/events/:eventId/stats", async (req, res) => {
+  const { eventId } = req.params;
+
+  try {
+    // Invitations pour cet événement
+    const { data: invitations, error: invError } = await supabase
+      .from("invitations")
+      .select("email")
+      .eq("event_id", eventId);
+
+    if (invError) {
+      console.error("❌ Erreur récupération invitations pour stats:", invError);
+      return res.status(500).json({ error: "Erreur récupération invitations" });
+    }
+
+    // Vidéos reçues pour cet événement
+    const { data: videos, error: vidError } = await supabase
+      .from("videos")
+      .select("participant_name")
+      .eq("event_id", eventId);
+
+    if (vidError) {
+      console.error("❌ Erreur récupération vidéos pour stats:", vidError);
+      return res.status(500).json({ error: "Erreur récupération vidéos" });
+    }
+
+    const totalInvitations = invitations?.length || 0;
+    const participantsWithVideo = new Set(
+      (videos || []).map((v) => v.participant_name)
+    );
+
+    // Hypothèse : participant_name = email invité
+    const totalWithVideo = (invitations || []).filter((inv) =>
+      participantsWithVideo.has(inv.email)
+    ).length;
+
+    const totalPending = totalInvitations - totalWithVideo;
+
+    return res.json({
+      totalInvitations,
+      totalWithVideo,
+      totalPending,
+    });
+  } catch (err) {
+    console.error("❌ Erreur /api/events/:eventId/stats :", err);
+    return res.status(500).json({ error: "Erreur serveur stats événement" });
+  }
+});
+
+// ======================================================
+// ✅ Route de relance manuelle des participants
+// ======================================================
+app.post("/api/events/:eventId/remind", async (req, res) => {
+  const { eventId } = req.params;
+
+  try {
+    // 1. Charger l’évènement
+    const { data: event, error: eventErr } = await supabase
+      .from("events")
+      .select("title, deadline, user_id")
+      .eq("id", eventId)
+      .single();
+
+    if (eventErr || !event) {
+      return res.status(404).json({ error: "Event introuvable" });
+    }
+
+    // 2. Récupérer les invitations
+    const { data: invitations, error: invErr } = await supabase
+      .from("invitations")
+      .select("email, id")
+      .eq("event_id", eventId);
+
+    if (invErr) throw invErr;
+
+    // 3. Récupérer les vidéos existantes
+    const { data: videos, error: vidErr } = await supabase
+      .from("videos")
+      .select("participant_name")
+      .eq("event_id", eventId);
+
+    if (vidErr) throw vidErr;
+
+    const participantsWhoSent = videos.map((v) => v.participant_name);
+
+    // 4. Filtrer les invités sans vidéo
+    const pendingInvitations = invitations.filter(
+      (inv) => !participantsWhoSent.includes(inv.email)
+    );
+
+    // 5. Envoyer les relances email
+    for (const inv of pendingInvitations) {
+      await emailService.sendMail({
+        to: inv.email,
+        subject: `Rappel : Il ne te reste plus beaucoup de temps pour participer à "${event.title}"`,
+        text: `Il ne reste plus beaucoup de temps pour envoyer ta vidéo.`,
+        html: `
+         <div style="font-family: Inter, Arial, sans-serif; background:#f4f6f9; padding:32px;">
+    <div style="
+      max-width:600px;
+      margin:auto;
+      background:#ffffff;
+      border-radius:18px;
+      overflow:hidden;
+      box-shadow:0 10px 35px rgba(0,0,0,0.12);
+    ">
+
+      <!-- HEADER -->
+      <div style="background:#0f172a; padding:32px 24px; text-align:center;">
+        <img src="https://cgqnrqbyvetcgwolkjvl.supabase.co/storage/v1/object/public/gregaplay-assets/logo.png"
+             alt="Grega Play"
+             style="width:180px; height:auto; display:block; margin:auto;" />
+        <p style="color:#e2e8f0; font-size:14px; margin-top:12px; opacity:0.8;">
+          Together, we create the moment
+        </p>
+      </div>
+
+      <!-- CONTENU -->
+      <div style="padding:32px;">
+        <h2 style="font-size:22px; margin:0; color:#0f172a; text-align:center;">
+          ⏰ Dernier rappel !
+        </h2>
+
+        <p style="margin-top:18px; font-size:15px; color:#334155; text-align:center; line-height:1.6;">
+          Il reste moins de <strong>24 heures</strong> pour participer à l'évènement :
+          <br />
+          <span style="font-size:18px; color:#16a34a;"><strong>${event.title}</strong></span>
+        </p>
+
+        <p style="margin-top:12px; font-size:14px; color:#475569; line-height:1.6; text-align:center;">
+          Envoie ta vidéo maintenant pour apparaître dans le montage final
+        </p>
+
+        <!-- BOUTON CTA -->
+        <div style="text-align:center; margin:28px 0 24px;">
+          <a href="https://gregaplay.com/invitation/${inv.token}"
+             style="
+               background:linear-gradient(135deg, #16a34a, #059669);
+               padding:16px 36px;
+               display:inline-block;
+               font-size:16px;
+               font-weight:bold;
+               color:#ffffff;
+               border-radius:12px;
+               text-decoration:none;
+               box-shadow:0 6px 18px rgba(0,0,0,0.20);
+             "
+             target="_blank"
+          >
+            👉 Participer à l’évènement
+          </a>
+        </div>
+
+        <p style="font-size:12px; text-align:center; color:#64748b;">
+          Si le bouton ne fonctionne pas, ouvre ce lien :
+          <br />
+          <a href="https://gregaplay.com/invitation/${inv.token}" 
+             style="color:#16a34a;"
+          >
+            https://gregaplay.com/invitation/${inv.token}
+          </a>
+        </p>
+      </div>
+
+      <!-- FOOTER -->
+      <div style="background:#f8fafc; padding:16px; text-align:center; font-size:12px; color:#94a3b8;">
+        Grega Play – L’émotion se construit ensemble<br/>
+        <span style="font-size:11px; color:#94a3b8;">Rappel automatique</span>
+      </div>
+
+    </div>
+  </div>
+`,
+      });
+    }
+
+    return res.json({
+      message: "Relance envoyée",
+      remindersSent: pendingInvitations.length,
+    });
+  } catch (err) {
+    console.error("❌ Erreur remind:", err);
+    return res.status(500).json({ error: "Erreur serveur lors de la relance" });
   }
 });
 
