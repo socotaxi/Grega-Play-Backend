@@ -130,16 +130,35 @@ router.post("/contact", async (req, res) => {
 
     // 2) Vérification formCreatedAt (anti-bot trop rapide)
     const createdAtMs = Number(formCreatedAt);
-    if (!createdAtMs || Number.isNaN(createdAtMs) || now - createdAtMs < 3000) {
-      console.warn("🛑 Spam contact détecté (form soumis trop vite).", {
-        to,
-        formCreatedAt,
-        deltaMs: now - createdAtMs,
-      });
-      return res
-        .status(429)
-        .json({ error: "Envoi détecté comme spam (trop rapide)." });
-    }
+const deltaMs = now - createdAtMs;
+
+// Si formCreatedAt est absent ou invalide → on ne bloque pas là-dessus
+if (!createdAtMs || Number.isNaN(createdAtMs)) {
+  console.warn("⚠️ formCreatedAt invalide ou absent, pas de blocage sur le temps.", {
+    to,
+    formCreatedAt,
+  });
+} else {
+  // Si le serveur est en retard (delta négatif) → on ne bloque pas
+  if (deltaMs < 0) {
+    console.warn("⚠️ Horloge serveur en retard par rapport au client.", {
+      to,
+      formCreatedAt,
+      deltaMs,
+    });
+  } else if (deltaMs < 3000) {
+    // Seulement si delta entre 0 et 3 secondes → spam
+    console.warn("🛑 Spam contact détecté (form soumis trop vite).", {
+      to,
+      formCreatedAt,
+      deltaMs,
+    });
+    return res
+      .status(429)
+      .json({ error: "Envoi détecté comme spam (trop rapide)." });
+  }
+}
+
 
     // 3) Rate-limit par IP + email
     const ip = getClientIp(req);
