@@ -26,14 +26,21 @@ export default async function processVideo(eventId, selectedVideoIds) {
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
 
   // 🔄 Mettre l'événement en "processing"
-  await supabase.from("events").update({ status: "processing" }).eq("id", eventId);
+  await supabase
+    .from("events")
+    .update({ status: "processing" })
+    .eq("id", eventId);
 
   if (!Array.isArray(selectedVideoIds) || selectedVideoIds.length < 2) {
-    throw new Error("Au moins 2 vidéos doivent être sélectionnées pour le montage.");
+    throw new Error(
+      "Au moins 2 vidéos doivent être sélectionnées pour le montage."
+    );
   }
 
   // 1. Récupérer les vidéos sélectionnées
-  console.log("➡️ Étape 1 : Récupération des vidéos sélectionnées depuis Supabase...");
+  console.log(
+    "➡️ Étape 1 : Récupération des vidéos sélectionnées depuis Supabase..."
+  );
   const { data: videos, error } = await supabase
     .from("videos")
     .select("id, storage_path")
@@ -51,10 +58,14 @@ export default async function processVideo(eventId, selectedVideoIds) {
     .filter(Boolean);
 
   if (!orderedVideos.length) {
-    throw new Error("Impossible de faire correspondre les vidéos sélectionnées.");
+    throw new Error(
+      "Impossible de faire correspondre les vidéos sélectionnées."
+    );
   }
 
-  console.log(`✅ ${orderedVideos.length} vidéos sélectionnées pour le montage.`);
+  console.log(
+    `✅ ${orderedVideos.length} vidéos sélectionnées pour le montage.`
+  );
 
   // 2. Préparer temp dir (même dossier tmp que server.js)
   const tempRoot = path.join(__dirname, "tmp");
@@ -93,10 +104,24 @@ export default async function processVideo(eventId, selectedVideoIds) {
     await Promise.all(batchPromises);
   }
 
+  // 3.1 Récupérer la durée de chaque vidéo normalisée (pour calculer les offsets xfade)
+  console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
+  const durations = [];
+  for (const p of processedPaths) {
+    const d = await getVideoDuration(p);
+    durations.push(d);
+  }
+
   const outputPath = path.join(tempDir, "final.mp4");
 
-  // 4. Concat avec fallback audio
-  await runFFmpegFilterConcat(processedPaths, outputPath);
+  // 4. Concat avec transitions modernes (xfade) + audio crossfade
+  await runFFmpegFilterConcat(
+    processedPaths,
+    durations,
+    outputPath,
+    "fadeblack", // transition par défaut pour compte gratuit
+    0.3 // durée de la transition
+  );
 
   // 4.1 Appliquer le filigrane sur la vidéo concaténée (avec fallback si ça plante)
   const noWmPath = path.join(tempDir, "final_no_wm.mp4");
@@ -105,7 +130,9 @@ export default async function processVideo(eventId, selectedVideoIds) {
   try {
     await applyWatermark(noWmPath, outputPath);
   } catch (e) {
-    console.error("⚠️ Erreur lors de l'application du watermark, on garde la vidéo sans filigrane.");
+    console.error(
+      "⚠️ Erreur lors de l'application du watermark, on garde la vidéo sans filigrane."
+    );
     console.error(e);
 
     // Si final.mp4 n'existe pas (échec du watermark), on revient au fichier sans watermark
@@ -152,7 +179,9 @@ function downloadFile(url, outputPath) {
 
     const req = client.get(url, { rejectUnauthorized: false }, (res) => {
       if (res.statusCode !== 200) {
-        return reject(new Error(`Échec téléchargement ${url}: ${res.statusCode}`));
+        return reject(
+          new Error(`Échec téléchargement ${url}: ${res.statusCode}`)
+        );
       }
       res.pipe(file);
       file.on("finish", () => file.close(resolve));
@@ -186,61 +215,130 @@ function normalizeVideo(inputPath, outputPath, maxSeconds = 30) {
   });
 }
 
-// ✅ Concat avec fallback si l'audio pose problème
-function runFFmpegFilterConcat(videoPaths, outputPath) {
+// ✅ Récupérer la durée d'une vidéo (ffprobe)
+function getVideoDuration(inputPath) {
   return new Promise((resolve, reject) => {
-    const inputs = videoPaths.map(p => `-i "${p}"`).join(" ");
+    const cmd = `ffprobe -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`;
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ ffprobe error:", stderr || stdout);
+        return reject(new Error("Erreur ffprobe (duration)"));
+      }
+      const duration = parseFloat(String(stdout).trim());
+      if (isNaN(duration)) {
+        return reject(new Error("Durée vidéo invalide"));
+      }
+      resolve(duration);
+    });
+  });
+}
 
-    const withAudioFilterInputs = videoPaths
-      .map((_, i) => `[${i}:v:0][${i}:a:0]`)
-      .join("");
+// ✅ Concat + transitions xfade (vidéo) + acrossfade (audio)
+function runFFmpegFilterConcat(
+  videoPaths,
+  durations,
+  outputPath,
+  transition = "fadeblack",
+  transDuration = 0.3
+) {
+  return new Promise((resolve, reject) => {
+    const n = videoPaths.length;
+    if (!Array.isArray(videoPaths) || n === 0) {
+      return reject(new Error("Aucune vidéo à concaténer"));
+    }
 
-    const videoOnlyFilterInputs = videoPaths
-      .map((_, i) => `[${i}:v:0]`)
-      .join("");
+    // Sécurité sur la taille du tableau des durées
+    if (!Array.isArray(durations) || durations.length !== n) {
+      return reject(
+        new Error(
+          "Le tableau des durées ne correspond pas au nombre de vidéos."
+        )
+      );
+    }
 
-    // 1️⃣ Tentative avec audio
-    const cmdWithAudio = `ffmpeg -y ${inputs} \
--filter_complex "${withAudioFilterInputs}concat=n=${videoPaths.length}:v=1:a=1[outv][outa]" \
--map "[outv]" -map "[outa]" \
+    const inputs = videoPaths.map((p) => `-i "${p}"`).join(" ");
+
+    if (n === 1) {
+      // Cas trivial : une seule vidéo (pas de transition à appliquer)
+      const cmdSingle = `ffmpeg -y -i "${videoPaths[0]}" \
+-c:v libx264 -preset veryfast -crf 26 \
+-c:a aac -b:a 96k -ar 44100 \
+-movflags +faststart \
+"${outputPath}"`;
+
+      console.log("➡️ FFmpeg concat (single):", cmdSingle);
+      exec(cmdSingle, (error, stdout, stderr) => {
+        if (error) {
+          console.error("❌ FFmpeg single error:", stderr || stdout);
+          return reject(new Error("Erreur FFmpeg (single concat)"));
+        }
+        console.log("✅ FFmpeg terminé (single)");
+        return resolve();
+      });
+      return;
+    }
+
+    // Calcul des offsets pour xfade
+    // offset0 = d0 - t
+    // offset1 = d0 + d1 - 2t
+    // offset2 = d0 + d1 + d2 - 3t, etc.
+    const offsets = [];
+    let total = durations[0];
+
+    for (let i = 0; i < n - 1; i++) {
+      const off = Math.max(total - transDuration, 0);
+      offsets.push(off);
+      total = total + durations[i + 1] - transDuration;
+    }
+
+    const filterParts = [];
+    let vPrev = "[0:v]";
+    let aPrev = "[0:a]";
+
+    for (let i = 1; i < n; i++) {
+      const vCur = `[${i}:v]`;
+      const aCur = `[${i}:a]`;
+
+      const vOut = i === n - 1 ? "[vout]" : `[v${i}]`;
+      const aOut = i === n - 1 ? "[aout]" : `[a${i}]`;
+
+      const offset = offsets[i - 1];
+
+      // Vidéo : xfade avec offset calculé
+      filterParts.push(
+        `${vPrev}${vCur} xfade=transition=${transition}:duration=${transDuration}:offset=${offset} ${vOut}`
+      );
+
+      // Audio : crossfade simple (acrossfade)
+      filterParts.push(
+        `${aPrev}${aCur} acrossfade=d=${transDuration}:c1=tri:c2=tri ${aOut}`
+      );
+
+      vPrev = vOut;
+      aPrev = aOut;
+    }
+
+    const filterComplex = filterParts.join("; ");
+
+    const cmd = `ffmpeg -y ${inputs} \
+-filter_complex "${filterComplex}" \
+-map "[vout]" -map "[aout]" \
 -c:v libx264 -preset veryfast -crf 26 \
 -c:a aac -b:a 96k -ar 44100 \
 -movflags +faststart \
 -threads 2 \
 "${outputPath}"`;
 
-    console.log("➡️ FFmpeg concat (avec audio):", cmdWithAudio);
+    console.log("➡️ FFmpeg concat + transitions:", cmd);
 
-    exec(cmdWithAudio, (error, stdout, stderr) => {
-      if (!error) {
-        console.log("✅ FFmpeg concat terminé (avec audio)");
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ FFmpeg transitions error:", stderr || stdout);
+        return reject(new Error("Erreur FFmpeg (transitions concat)"));
+      } else {
+        console.log("✅ Vidéo concaténée avec transitions :", outputPath);
+        return resolve();
       }
-      if (!error) return resolve();
-
-      console.error("❌ FFmpeg concat avec audio a échoué, on tente sans audio.");
-      console.error("   Détails:", stderr || stdout);
-
-      // 2️⃣ Fallback vidéo seule
-      const cmdVideoOnly = `ffmpeg -y ${inputs} \
--filter_complex "${videoOnlyFilterInputs}concat=n=${videoPaths.length}:v=1[outv]" \
--map "[outv]" \
--c:v libx264 -preset veryfast -crf 26 \
--movflags +faststart \
--threads 2 \
-"${outputPath}"`;
-
-      console.log("➡️ FFmpeg concat (vidéo seule):", cmdVideoOnly);
-
-      exec(cmdVideoOnly, (error2, stdout2, stderr2) => {
-        if (error2) {
-          console.error("❌ FFmpeg concat vidéo seule a aussi échoué.");
-          console.error("   Détails:", stderr2 || stdout2);
-          return reject(new Error("Erreur FFmpeg (concat)"));
-        } else {
-          console.log("✅ FFmpeg concat terminé (vidéo seule, sans audio)");
-          return resolve();
-        }
-      });
     });
   });
 }
@@ -252,7 +350,9 @@ function applyWatermark(inputPath, outputPath) {
 
     // ✅ Sécuriser : si le fichier watermark n'existe pas, on skip proprement
     if (!fs.existsSync(watermarkPath)) {
-      console.warn("⚠️ Watermark introuvable, on génère la vidéo sans filigrane.");
+      console.warn(
+        "⚠️ Watermark introuvable, on génère la vidéo sans filigrane."
+      );
       // On recopie simplement la vidéo d'entrée vers la sortie
       fs.copyFileSync(inputPath, outputPath);
       return resolve();
