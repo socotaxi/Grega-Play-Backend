@@ -195,6 +195,27 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 );
 
+// 🔄 Helper pour extraire bucket + path à partir d’une URL publique Supabase
+function extractStorageInfoFromPublicUrl(publicUrl) {
+  try {
+    if (!publicUrl || !process.env.SUPABASE_URL) return null;
+    const base = `${process.env.SUPABASE_URL}/storage/v1/object/public/`;
+    if (!publicUrl.startsWith(base)) return null;
+
+    const rel = publicUrl.slice(base.length); // ex: "final-videos/event-123/file.mp4"
+    const firstSlash = rel.indexOf("/");
+    if (firstSlash === -1) return null;
+
+    const bucket = rel.slice(0, firstSlash);
+    const path = rel.slice(firstSlash + 1);
+
+    if (!bucket || !path) return null;
+    return { bucket, path };
+  } catch {
+    return null;
+  }
+}
+
 // 🔔 Notifs : helper quand une nouvelle vidéo est envoyée (créateur uniquement)
 async function notifyEventOwnerOnNewVideo(eventId, participantName) {
   try {
@@ -970,6 +991,112 @@ app.post("/api/events/:eventId/remind", async (req, res) => {
   } catch (err) {
     console.error("❌ Erreur remind:", err);
     return res.status(500).json({ error: "Erreur serveur lors de la relance" });
+  }
+});
+
+// ======================================================
+// 🗑️ Suppression d’un événement + cascade
+//     + contrôle créateur
+//     + suppression éventuelle de la vidéo finale
+// ======================================================
+app.delete("/api/events/:eventId", async (req, res) => {
+  const { eventId } = req.params;
+  const { userId } = req.body || {}; // 🔄 on récupère le userId envoyé par le front
+
+  if (!userId) {
+    return res
+      .status(400)
+      .json({ error: "userId requis pour supprimer l'événement" });
+  }
+
+  try {
+    // 1) Vérifier que l'événement existe + récupérer le créateur + URL finale
+    const { data: event, error: eventErr } = await supabase
+      .from("events")
+      .select("id, user_id, final_video_url")
+      .eq("id", eventId)
+      .single();
+
+    if (eventErr || !event) {
+      return res.status(404).json({ error: "Événement introuvable" });
+    }
+
+    // 2) Vérifier que le userId correspondant est bien le créateur
+    if (event.user_id !== userId) {
+      return res.status(403).json({
+        error: "FORBIDDEN",
+        message: "Seul le créateur de l'événement peut le supprimer.",
+      });
+    }
+
+    // 3) Récupérer les vidéos pour supprimer les fichiers du Storage
+    const { data: videos, error: videosErr } = await supabase
+      .from("videos")
+      .select("id, storage_path")
+      .eq("event_id", eventId);
+
+    if (videosErr) throw videosErr;
+
+    if (videos && videos.length > 0) {
+      const paths = videos
+        .map((v) => v.storage_path)
+        .filter((p) => typeof p === "string" && p.length > 0);
+
+      if (paths.length > 0) {
+        const { error: storageErr } = await supabase.storage
+          .from("videos")
+          .remove(paths);
+        if (storageErr) throw storageErr;
+      }
+    }
+
+    // 4) Supprimer les vidéos (en base)
+    await supabase.from("videos").delete().eq("event_id", eventId);
+
+    // 5) Supprimer les invitations
+    await supabase.from("invitations").delete().eq("event_id", eventId);
+
+    // 6) Supprimer les participants
+    await supabase.from("event_participants").delete().eq("event_id", eventId);
+
+    // 7) Supprimer les logs d'upload liés à cet événement
+    await supabase.from("upload_logs").delete().eq("event_id", eventId);
+
+    // 8) Supprimer la vidéo finale dans son bucket si possible
+    if (event.final_video_url) {
+      const info = extractStorageInfoFromPublicUrl(event.final_video_url);
+      if (info) {
+        const { bucket, path } = info;
+        try {
+          const { error: finalStorageErr } = await supabase.storage
+            .from(bucket)
+            .remove([path]);
+          if (finalStorageErr) {
+            console.error(
+              "⚠️ Erreur suppression fichier vidéo finale:",
+              finalStorageErr
+            );
+          }
+        } catch (e) {
+          console.error("⚠️ Exception suppression vidéo finale:", e);
+        }
+      }
+    }
+
+    // 9) Supprimer l'événement lui-même
+    const { error: delEventErr } = await supabase
+      .from("events")
+      .delete()
+      .eq("id", eventId);
+
+    if (delEventErr) throw delEventErr;
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Erreur suppression événement:", err);
+    return res.status(500).json({
+      error: "Erreur lors de la suppression de l'événement",
+    });
   }
 });
 

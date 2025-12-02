@@ -7,6 +7,7 @@ import http from "http";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import fetch from "cross-fetch";
+import { promisify } from "util";
 
 global.fetch = fetch;
 
@@ -21,6 +22,31 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+// 🔐 Helper pour éviter l'erreur EBUSY sur Windows lors du rename
+const renameAsync = promisify(fs.rename);
+
+async function safeRenameWithRetry(src, dest, options = {}) {
+  const { retries = 8, delayMs = 300 } = options;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      await renameAsync(src, dest);
+      return; // succès
+    } catch (err) {
+      if (err.code === "EBUSY" && attempt < retries) {
+        console.warn(
+          `[safeRenameWithRetry] EBUSY lors du rename ${src} → ${dest}, tentative ${
+            attempt + 1
+          }/${retries + 1}. Nouvel essai dans ${delayMs}ms...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      throw err; // autre erreur ou plus de retries
+    }
+  }
+}
 
 export default async function processVideo(eventId, selectedVideoIds) {
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
@@ -123,10 +149,45 @@ export default async function processVideo(eventId, selectedVideoIds) {
     0.3 // durée de la transition
   );
 
-  // 4.1 Appliquer le filigrane sur la vidéo concaténée (avec fallback si ça plante)
-  const noWmPath = path.join(tempDir, "final_no_wm.mp4");
-  fs.renameSync(outputPath, noWmPath);
+  // 4.1 Ajouter intro + outro + musique signature (musique seulement sur intro/outro)
+  const corePath = path.join(tempDir, "final_core.mp4");
 
+  // 🔧 Remplace fs.renameSync par un rename robuste (gère EBUSY)
+  await safeRenameWithRetry(outputPath, corePath, {
+    retries: 8,
+    delayMs: 300,
+  });
+
+  let coreDuration = 0;
+  try {
+    coreDuration = await getVideoDuration(corePath);
+  } catch (e) {
+    console.warn("⚠️ Impossible de récupérer la durée de la vidéo core:", e);
+  }
+
+  const introPath = path.join(__dirname, "assets", "intro.png");
+  const outroPath = path.join(__dirname, "assets", "outro.png");
+  const totalDuration = 3 + coreDuration + 2; // 3s intro + core + 2s outro
+
+  const noWmPath = path.join(tempDir, "final_no_wm.mp4");
+
+  try {
+    await addIntroOutroWithMusic(
+      corePath,
+      noWmPath,
+      introPath,
+      outroPath,
+      totalDuration
+    );
+  } catch (e) {
+    console.error(
+      "⚠️ Erreur lors de l'ajout intro/outro + musique, on garde la vidéo core sans habillage.",
+      e
+    );
+    fs.copyFileSync(corePath, noWmPath);
+  }
+
+  // 4.2 Appliquer le filigrane sur la vidéo habillée (avec fallback si ça plante)
   try {
     await applyWatermark(noWmPath, outputPath);
   } catch (e) {
@@ -192,11 +253,11 @@ function downloadFile(url, outputPath) {
   });
 }
 
-// ✅ Normalisation optimisée en 9:16 portrait
+// ✅ Normalisation optimisée en 9:16 portrait (720x1280)
 function normalizeVideo(inputPath, outputPath, maxSeconds = 30) {
   return new Promise((resolve, reject) => {
     const cmd = `ffmpeg -y -i "${inputPath}" -t ${maxSeconds} \
--vf "scale=576:1024:flags=bicubic,fps=25,setsar=1:1,setdar=9/16" \
+-vf "scale=720:1280:flags=bicubic,fps=25,setsar=1:1,setdar=9/16" \
 -c:v libx264 -preset veryfast -crf 26 \
 -c:a aac -b:a 96k -ar 44100 \
 -movflags +faststart \
@@ -337,6 +398,118 @@ function runFFmpegFilterConcat(
         return reject(new Error("Erreur FFmpeg (transitions concat)"));
       } else {
         console.log("✅ Vidéo concaténée avec transitions :", outputPath);
+        return resolve();
+      }
+    });
+  });
+}
+
+// ✨ Ajouter intro + outro + musique signature UNIQUEMENT sur intro/outro (SANS fade in/out)
+function addIntroOutroWithMusic(
+  corePath,
+  outputPath,
+  introPath,
+  outroPath,
+  totalDuration
+) {
+  return new Promise((resolve, reject) => {
+    // Si les assets visuels n'existent pas, on skip proprement
+    if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
+      console.warn(
+        "⚠️ intro.png ou outro.png introuvable, on génère sans habillage."
+      );
+      fs.copyFileSync(corePath, outputPath);
+      return resolve();
+    }
+
+    const musicPath = path.join(__dirname, "assets", "signature.mp3");
+    const hasMusic = fs.existsSync(musicPath);
+
+    const safeTotal = Math.max(0, Number(totalDuration) || 0);
+    const introDur = 3;
+    const outroDur = 2;
+    const coreDur = Math.max(safeTotal - introDur - outroDur, 0);
+    const outroStartMs = Math.floor((introDur + coreDur) * 1000);
+
+    // 👉 Cas sans musique : intro/outro uniquement visuel, audio = voix du core
+    if (!hasMusic) {
+      console.warn(
+        "⚠️ signature.mp3 introuvable, on ajoute intro/outro mais sans musique de fond."
+      );
+
+      const cmdNoMusic = `ffmpeg -y \
+-loop 1 -t 3 -i "${introPath}" \
+-i "${corePath}" \
+-loop 1 -t 2 -i "${outroPath}" \
+-filter_complex "\
+[0:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v0]; \
+[1:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v1]; \
+[2:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v2]; \
+[v0][v1][v2]concat=n=3:v=1:a=0[v]; \
+[1:a]adelay=${introDur * 1000}|${introDur * 1000}[voice]" \
+-map "[v]" -map "[voice]" \
+-c:v libx264 -preset veryfast -crf 23 \
+-c:a aac -b:a 96k -ar 44100 \
+-movflags +faststart \
+"${outputPath}"`;
+
+      console.log("➡️ FFmpeg intro/outro (sans musique):", cmdNoMusic);
+
+      exec(cmdNoMusic, (error, stdout, stderr) => {
+        if (error) {
+          console.error(
+            "❌ FFmpeg intro/outro error (sans musique):",
+            stderr || stdout
+          );
+          return reject(new Error("Erreur FFmpeg (intro/outro sans musique)"));
+        } else {
+          console.log("✅ Intro + outro ajoutées (sans musique) :", outputPath);
+          return resolve();
+        }
+      });
+
+      return;
+    }
+
+    // 👉 Cas avec musique signature UNIQUEMENT sur intro + outro, volume constant (pas de fade)
+    const cmd = `ffmpeg -y \
+-loop 1 -t 3 -i "${introPath}" \
+-i "${corePath}" \
+-loop 1 -t 2 -i "${outroPath}" \
+-i "${musicPath}" \
+-filter_complex "\
+[0:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v0]; \
+[1:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v1]; \
+[2:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v2]; \
+[v0][v1][v2]concat=n=3:v=1:a=0[v]; \
+[1:a]adelay=${introDur * 1000}|${introDur * 1000},volume=1.0[voice]; \
+[3:a]atrim=0:${introDur},asetpts=PTS-STARTPTS,volume=0.25[bgIntro]; \
+[3:a]atrim=0:${outroDur},asetpts=PTS-STARTPTS,volume=0.25,adelay=${outroStartMs}|${outroStartMs}[bgOutro]; \
+[bgIntro][bgOutro]amix=inputs=2:dropout_transition=0[bgAll]; \
+[bgAll][voice]amix=inputs=2:dropout_transition=0[a]" \
+-map "[v]" -map "[a]" \
+-c:v libx264 -preset veryfast -crf 23 \
+-c:a aac -b:a 96k -ar 44100 \
+-movflags +faststart \
+"${outputPath}"`;
+
+    console.log(
+      "➡️ FFmpeg intro/outro + musique (intro/outro seulement, SANS fades):",
+      cmd
+    );
+
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error(
+          "❌ FFmpeg intro/outro + musique error:",
+          stderr || stdout
+        );
+        return reject(new Error("Erreur FFmpeg (intro/outro + musique)"));
+      } else {
+        console.log(
+          "✅ Intro + outro + musique signature (intro/outro seulement) ajoutées :",
+          outputPath
+        );
         return resolve();
       }
     });
