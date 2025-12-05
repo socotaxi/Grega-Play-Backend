@@ -527,14 +527,14 @@ app.post(
       });
     }
 
-    // 🔒 Vérifier si le participant est le créateur OU un invité
+    // 🔒 Vérifier si le participant est le créateur OU un invité (sauf si événement public)
     try {
       const participantEmailNorm = participantName.trim().toLowerCase();
 
-      // 1) Récupérer l'événement pour connaître le user_id du créateur
+      // 1) Récupérer l'événement pour connaître le user_id du créateur + visibilité
       const { data: eventRow, error: eventErr } = await supabase
         .from("events")
-        .select("id, user_id")
+        .select("id, user_id, is_public")
         .eq("id", eventId)
         .single();
 
@@ -545,52 +545,57 @@ app.post(
           .json({ error: "Événement introuvable pour le contrôle d’invitation." });
       }
 
-      // 2) Récupérer l'email du créateur dans profiles
-      const { data: ownerProfile, error: ownerErr } = await supabase
-        .from("profiles")
-        .select("email")
-        .eq("id", eventRow.user_id)
-        .single();
+      const isPublicEvent = eventRow.is_public === true;
 
-      if (ownerErr) {
-        console.error("❌ Erreur récupération profil créateur:", ownerErr);
-      }
-
-      let isCreator = false;
-      if (ownerProfile?.email) {
-        const ownerEmailNorm = ownerProfile.email.trim().toLowerCase();
-        isCreator = ownerEmailNorm === participantEmailNorm;
-      }
-
-      if (!isCreator) {
-        // 3) Si ce n'est pas le créateur → vérifier s'il est invité
-        const { data: invites, error: inviteErr } = await supabase
-          .from("invitations")
+      // 👉 Si l'événement est public : on laisse passer tout le monde
+      if (!isPublicEvent) {
+        // 2) Récupérer l'email du créateur dans profiles
+        const { data: ownerProfile, error: ownerErr } = await supabase
+          .from("profiles")
           .select("email")
-          .eq("event_id", eventId)
-          .eq("email", participantName);
+          .eq("id", eventRow.user_id)
+          .single();
 
-        if (inviteErr) {
-          console.error("❌ Erreur vérification invitation:", inviteErr);
-          return res
-            .status(500)
-            .json({ error: "Erreur interne (invitation check)" });
+        if (ownerErr) {
+          console.error("❌ Erreur récupération profil créateur:", ownerErr);
         }
 
-        if (!invites || invites.length === 0) {
-          await logRejectedUpload({
-            req,
-            reason: "non_invité",
-            file,
-            eventId,
-            participantName,
-          });
+        let isCreator = false;
+        if (ownerProfile?.email) {
+          const ownerEmailNorm = ownerProfile.email.trim().toLowerCase();
+          isCreator = ownerEmailNorm === participantEmailNorm;
+        }
 
-          return res.status(403).json({
-            error: "NOT_INVITED",
-            message:
-              "Tu n'as pas été invité à cet événement. Impossible d'envoyer une vidéo.",
-          });
+        if (!isCreator) {
+          // 3) Si ce n'est pas le créateur → vérifier s'il est invité
+          const { data: invites, error: inviteErr } = await supabase
+            .from("invitations")
+            .select("email")
+            .eq("event_id", eventId)
+            .eq("email", participantName);
+
+          if (inviteErr) {
+            console.error("❌ Erreur vérification invitation:", inviteErr);
+            return res
+              .status(500)
+              .json({ error: "Erreur interne (invitation check)" });
+          }
+
+          if (!invites || invites.length === 0) {
+            await logRejectedUpload({
+              req,
+              reason: "non_invité",
+              file,
+              eventId,
+              participantName,
+            });
+
+            return res.status(403).json({
+              error: "NOT_INVITED",
+              message:
+                "Tu n'as pas été invité à cet événement. Impossible d'envoyer une vidéo.",
+            });
+          }
         }
       }
     } catch (err) {
