@@ -553,7 +553,64 @@ function applyWatermark(inputPath, outputPath) {
   });
 }
 
-export default async function processVideo(eventId, selectedVideoIds, effectivePreset = null) {
+export default async function processVideo(eventId, selectedVideoIds, effectivePreset = null, opts = {}) {
+
+  // ✅ Job watchdog (deadline + abort)
+  const jobId = opts?.jobId || null;
+  const deadlineMs = Number.isFinite(opts?.deadlineMs) ? Number(opts.deadlineMs) : (Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000);
+  const startedAtMs =
+    Number.isFinite(opts?.startedAtMs) ? Number(opts.startedAtMs) : Date.now();
+
+  async function _failJobIfNeeded(payload) {
+    if (!jobId) return;
+    try {
+      await supabase
+        .from("video_jobs")
+        .update({
+          ...payload,
+          finished_at: new Date().toISOString(),
+        })
+        .eq("id", jobId);
+    } catch (e) {
+      console.error("❌ JOB watchdog: impossible de mettre à jour video_jobs:", e?.message || e);
+    }
+  }
+
+  async function ensureJobAlive(stage) {
+    // Deadline
+    const now = Date.now();
+    if (deadlineMs > 0 && now - startedAtMs > deadlineMs) {
+      await _failJobIfNeeded({
+        status: "failed",
+        progress: 0,
+        error: `TIMEOUT: job processing > ${Math.round(deadlineMs / 1000)}s (stage=${stage})`,
+      });
+      const err = new Error("JOB_TIMEOUT");
+      err.code = "JOB_TIMEOUT";
+      throw err;
+    }
+
+    // Abort by admin (or external)
+    if (!jobId) return;
+    try {
+      const { data, error } = await supabase
+        .from("video_jobs")
+        .select("status,error")
+        .eq("id", jobId)
+        .maybeSingle();
+
+      if (error) return; // do not block processing for transient read errors
+      if (data && data.status && data.status !== "processing") {
+        const err = new Error("JOB_ABORTED");
+        err.code = "JOB_ABORTED";
+        err.details = { stage, status: data.status, error: data.error };
+        throw err;
+      }
+    } catch (e) {
+      if (e?.code === "JOB_ABORTED") throw e;
+      // ignore other errors
+    }
+  }
   // 🔒 Ensure preset shape is consistent everywhere (controller & processVideo)
   effectivePreset = normalizeEffectivePreset(effectivePreset);
 
@@ -616,6 +673,7 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
   // 1) vidéos
   console.log("➡️ Étape 1 : Récupération des vidéos sélectionnées depuis Supabase...");
+  await ensureJobAlive("download");
   const { data: videos, error } = await supabase
     .from("videos")
     .select("id, storage_path")
@@ -640,6 +698,7 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
   // 3) download + normalize
   console.log("➡️ Étape 3 : Téléchargement + Normalisation (portrait)...");
+  await ensureJobAlive("concat");
   const processedPaths = [];
   const CONCURRENCY = 2;
 

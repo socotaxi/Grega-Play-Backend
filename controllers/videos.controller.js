@@ -14,6 +14,47 @@ import { createVideoJob, updateVideoJob, getVideoJob } from "../services/db/vide
 import { resolvePreset } from "../services/videoProcessing/presetResolver.js";
 import { normalizeRequestedOptions, isPremiumPresetRequested } from "../services/videoProcessing/videoPreset.schema.js";
 
+const JOB_DEADLINE_MS =
+  Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000; // 12 minutes par défaut
+
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
+
+function isAdmin(req) {
+  const key = (req.headers["x-admin-key"] || "").toString();
+  return !!ADMIN_API_KEY && key === ADMIN_API_KEY;
+}
+
+async function failJobTimeoutIfNeeded(job) {
+  if (!job) return job;
+  if (job.status !== "processing") return job;
+  if (!job.started_at) return job;
+
+  const startedAt = new Date(job.started_at).getTime();
+  if (!Number.isFinite(startedAt)) return job;
+
+  const now = Date.now();
+  if (now - startedAt <= JOB_DEADLINE_MS) return job;
+
+  try {
+    await updateVideoJob(job.id, {
+      status: "failed",
+      progress: 0,
+      error: `TIMEOUT: job processing > ${Math.round(JOB_DEADLINE_MS / 1000)}s`,
+      finished_at: new Date().toISOString(),
+    });
+    return {
+      ...job,
+      status: "failed",
+      progress: 0,
+      error: `TIMEOUT: job processing > ${Math.round(JOB_DEADLINE_MS / 1000)}s`,
+      finished_at: new Date().toISOString(),
+    };
+  } catch (e) {
+    console.error("❌ Impossible de marquer le job en timeout:", e?.message || e);
+    return job;
+  }
+}
+
 // --------------------
 // Premium options helpers (controller-side)
 // --------------------
@@ -672,7 +713,7 @@ export async function processVideoSync(req, res) {
 
     console.log("📼 Lancement génération vidéo finale:", eventId, "vidéos:", videoIds.length);
 
-    const result = await processVideo(eventId, videoIds, effectivePreset);
+    const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
     const finalVideoUrl = result?.finalVideoUrl || null;
 
     if (!finalVideoUrl) {
@@ -812,7 +853,7 @@ export async function processVideoAsync(req, res) {
         });
 
         // ✅ IMPORTANT: passer effectivePreset au processVideo
-        const result = await processVideo(eventId, videoIds, effectivePreset);
+        const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
         const finalVideoUrl = result?.finalVideoUrl || null;
 
         await updateVideoJob(job.id, {
@@ -839,7 +880,7 @@ export async function processVideoAsync(req, res) {
     return res.status(202).json({
       message: "Montage lancé.",
       jobId: job.id,
-      status: job.status,
+      status: safeJob.status,
     });
   } catch (e) {
     console.error("❌ Erreur POST /api/videos/process-async:", e);
@@ -859,7 +900,11 @@ export async function getJobStatus(req, res) {
   try {
     const job = await getVideoJob(jobId);
 
-    const caps = await computeEventCapabilities({ userId, eventId: job.event_id });
+    // ⏱️ Deadline serveur: si un job reste en processing trop longtemps, on le passe en failed.
+    const jobAfterDeadline = await failJobTimeoutIfNeeded(job);
+    const safeJob = jobAfterDeadline || job;
+
+    const caps = await computeEventCapabilities({ userId, eventId: safeJob.event_id });
 
     if (!caps?.role?.isCreator && !caps?.role?.isInvited) {
       return res.status(403).json({
@@ -873,17 +918,17 @@ export async function getJobStatus(req, res) {
 
     return res.status(200).json({
       id: job.id,
-      eventId: job.event_id,
+      eventId: safeJob.event_id,
       userId: job.user_id,
-      status: job.status,
-      progress: job.progress,
-      requestedOptions: job.requested_options,
-      effectivePreset: job.effective_preset,
-      finalVideoUrl: job.final_video_url || null,
-      error: job.error || null,
-      createdAt: job.created_at,
-      startedAt: job.started_at,
-      finishedAt: job.finished_at,
+      status: safeJob.status,
+      progress: safeJob.progress,
+      requestedOptions: safeJob.requested_options,
+      effectivePreset: safeJob.effective_preset,
+      finalVideoUrl: safeJob.final_video_url || null,
+      error: safeJob.error || null,
+      createdAt: safeJob.created_at,
+      startedAt: safeJob.started_at,
+      finishedAt: safeJob.finished_at,
     });
   } catch (e) {
     console.error("❌ Erreur GET /api/videos/jobs/:jobId:", e);
@@ -892,3 +937,129 @@ export async function getJobStatus(req, res) {
     });
   }
 }
+
+// ===================== ADMIN: kill / retry job =====================
+
+export async function adminKillJob(req, res) {
+  if (!isAdmin(req)) {
+    return res
+      .status(401)
+      .json({ error: "Accès non autorisé (admin key invalide)." });
+  }
+
+  const { jobId } = req.params;
+  if (!jobId) return res.status(400).json({ error: "jobId est requis." });
+
+  try {
+    const job = await getVideoJob(jobId);
+    if (!job) return res.status(404).json({ error: "Job introuvable." });
+
+    await updateVideoJob(jobId, {
+      status: "failed",
+      progress: 0,
+      error: "KILLED_BY_ADMIN",
+      finished_at: new Date().toISOString(),
+    });
+
+    return res.status(200).json({ message: "Job marqué en failed.", jobId });
+  } catch (e) {
+    console.error("❌ adminKillJob error:", e);
+    return res.status(500).json({ error: "Erreur interne (adminKillJob)." });
+  }
+}
+
+export async function adminRetryJob(req, res) {
+  if (!isAdmin(req)) {
+    return res
+      .status(401)
+      .json({ error: "Accès non autorisé (admin key invalide)." });
+  }
+
+  const { jobId } = req.params;
+  if (!jobId) return res.status(400).json({ error: "jobId est requis." });
+
+  try {
+    const prev = await getVideoJob(jobId);
+    if (!prev) return res.status(404).json({ error: "Job introuvable." });
+
+    // Marque l'ancien job pour audit
+    try {
+      if (prev.status === "processing") {
+        await updateVideoJob(jobId, {
+          status: "failed",
+          progress: prev.progress ?? 0,
+          error: prev.error || "RETRY_REQUESTED",
+          finished_at: new Date().toISOString(),
+        });
+      }
+    } catch (_) {}
+
+    // Nouveau job (plus sûr que de reset le même id)
+    const newJob = await createVideoJob({
+      event_id: prev.event_id,
+      user_id: prev.user_id,
+      status: "processing",
+      progress: 5,
+      requested_options: prev.requested_options || {},
+      effective_preset: prev.effective_preset || {},
+      started_at: new Date().toISOString(),
+    });
+
+    // Lance le montage en arrière-plan
+    setImmediate(async () => {
+      try {
+        const eventId = newJob.event_id;
+
+        const { data: videos, error: videosError } = await supabase
+          .from("videos")
+          .select("id")
+          .eq("event_id", eventId);
+
+        if (videosError) throw videosError;
+
+        const videoIds = (videos || []).map((v) => v.id);
+        const effectivePreset = newJob.effective_preset || {};
+
+        const result = await processVideo(eventId, videoIds, effectivePreset, {
+          jobId: newJob.id,
+          deadlineMs: JOB_DEADLINE_MS,
+          startedAtMs: Date.now(),
+        });
+
+        const finalVideoUrl = result?.finalVideoUrl || null;
+
+        const latest = await getVideoJob(newJob.id);
+        if (latest?.status === "processing") {
+          await updateVideoJob(newJob.id, {
+            status: "done",
+            progress: 100,
+            final_video_url: finalVideoUrl,
+            finished_at: new Date().toISOString(),
+            error: null,
+          });
+        }
+      } catch (e) {
+        console.error("❌ adminRetry montage failed:", e?.message || e);
+        try {
+          await updateVideoJob(newJob.id, {
+            status: "failed",
+            progress: 0,
+            error: e?.message || "Erreur inconnue pendant le montage.",
+            finished_at: new Date().toISOString(),
+          });
+        } catch (_) {}
+      }
+    });
+
+    return res.status(202).json({
+      message: "Retry lancé.",
+      previousJobId: jobId,
+      newJobId: newJob.id,
+      status: newJob.status,
+    });
+  } catch (e) {
+    console.error("❌ adminRetryJob error:", e);
+    return res.status(500).json({ error: "Erreur interne (adminRetryJob)." });
+  }
+}
+
