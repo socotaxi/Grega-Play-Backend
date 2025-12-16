@@ -31,6 +31,25 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+// ------------------------------------------------------
+// ✅ Helpers robustes (PROD)
+// ------------------------------------------------------
+function toSafeNumber(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+
+  const normalized = String(value).trim().replace(",", ".");
+  const n = Number(normalized);
+
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n, min, max) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return min;
+  return Math.min(Math.max(x, min), max);
+}
+
 // 🔐 Helper pour éviter l'erreur EBUSY sur Windows lors du rename
 const renameAsync = promisify(fs.rename);
 
@@ -221,19 +240,23 @@ async function normalizeVideo(inputPath, outputPath, fps = 30) {
 // ------------------------------------------------------
 function runFFmpegFilterConcat(processedPaths, durations, outputPath, transition = "fadeblack", transitionDuration = 0.3) {
   return new Promise((resolve, reject) => {
+    // ✅ PROD GUARD: duration peut arriver comme "0,3" => le normaliser ici aussi
+    let td = toSafeNumber(transitionDuration, 0.6);
+    td = clamp(td, 0.1, 2.0);
+
     const inputs = processedPaths.map((p) => `-i "${p}"`).join(" ");
 
     let offset = 0;
     const offsets = [];
     for (let i = 0; i < durations.length - 1; i++) {
       const d = Number(durations[i]) || 0;
-      const step = Math.max(d - transitionDuration, 0);
+      const step = Math.max(d - td, 0);
       offset += step;
       offsets.push(Number(offset.toFixed(3)));
     }
 
     console.log("🧩 CONCAT DEBUG durations:", durations.map((d) => Number(d?.toFixed?.(3) ?? d)));
-    console.log("🧩 CONCAT DEBUG transition:", transition, "dur:", transitionDuration, "offsets:", offsets);
+    console.log("🧩 CONCAT DEBUG transition:", transition, "dur:", td, "offsets:", offsets);
 
     let filter = "";
 
@@ -259,8 +282,8 @@ function runFFmpegFilterConcat(processedPaths, durations, outputPath, transition
       const aOut = `a${i}o`;
       const off = offsets[i - 1] ?? 0;
 
-      filter += `[${vLast}][v${i}]xfade=transition=${transition}:duration=${transitionDuration}:offset=${off}[${vOut}];`;
-      filter += `[${aLast}][a${i}]acrossfade=d=${transitionDuration}:c1=tri:c2=tri[${aOut}];`;
+      filter += `[${vLast}][v${i}]xfade=transition=${transition}:duration=${td}:offset=${off}[${vOut}];`;
+      filter += `[${aLast}][a${i}]acrossfade=d=${td}:c1=tri:c2=tri[${aOut}];`;
 
       vLast = vOut;
       aLast = aOut;
@@ -652,13 +675,15 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
   // 4) concat with preset transition
   const presetForConcat = safePreset(effectivePresetResolved);
-  await runFFmpegFilterConcat(
-    processedPaths,
-    durations,
-    outputPath,
-    resolveTransitionName(presetForConcat),
-    resolveTransitionDuration(presetForConcat)
-  );
+  const transitionName = resolveTransitionName(presetForConcat);
+
+  // ✅ PROD FIX: transitionDuration peut être "0,3" (locale FR) => normaliser ici
+  const rawTransitionDuration = resolveTransitionDuration(presetForConcat);
+  const transitionDuration = clamp(toSafeNumber(rawTransitionDuration, 0.6), 0.1, 2.0);
+
+  console.log("🎚️ SAFE transitionDuration =", transitionDuration, "(raw:", rawTransitionDuration, ")");
+
+  await runFFmpegFilterConcat(processedPaths, durations, outputPath, transitionName, transitionDuration);
 
   // 4.1) intro/outro + music
   const corePath = path.join(tempDir, "final_core.mp4");
