@@ -1,132 +1,111 @@
+// backend/services/server.js
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import multer from "multer";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { exec } from "child_process";
-import util from "util";
 import { createClient } from "@supabase/supabase-js";
 import fetch from "cross-fetch";
+import sharp from "sharp";
+
 import notificationsRouter from "../routes/notifications.js";
-import { sendPushNotification } from "./pushService.js"; // 🔔 envoi des push
-import emailRoutes from "../routes/emailRoutes.js"; // 📧 routes email backend
-import whatsappAuthRoutes from "../routes/whatsappAuthRoutes.js"; // 📱 login téléphone / WhatsApp
-import emailService from "./emailService.js"; // ✅ nécessaire pour /api/events/:eventId/remind
+import { sendPushNotification } from "./pushService.js"; // (import conservé si utilisé ailleurs)
+import emailRoutes from "../routes/emailRoutes.js";
+import whatsappAuthRoutes from "../routes/whatsappAuthRoutes.js";
+import emailService from "./emailService.js";
 
-// ⚠️ Supabase client utilisé dans cette fonction sera défini plus bas
-async function logRejectedUpload({
-  req,
-  reason,
-  file = null,
-  eventId = null,
-  participantName = null,
-  duration = null,
-}) {
-  try {
-    const ip =
-      req.headers["x-forwarded-for"] ||
-      req.connection?.remoteAddress ||
-      req.socket?.remoteAddress ||
-      "unknown";
+import bodyParser from "body-parser";
+import stripePackage from "stripe";
 
-    const userAgent = req.headers["user-agent"] || null;
+import eventsRoutes from "../routes/events.routes.js";
+import billingRoutes from "../routes/billing.routes.js";
 
-    const rawRequest = {
-      headers: req.headers,
-      body: req.body,
-      url: req.originalUrl,
-      method: req.method,
-    };
+import capabilitiesRoutes from "../routes/capabilitiesRoutes.js";
 
-    await supabase.from("upload_logs").insert([
-      {
-        ip,
-        event_id: eventId,
-        participant_name: participantName,
-        file_name: file?.originalname || null,
-        mime_type: file?.mimetype || null,
-        file_size: file?.size || null,
-        duration,
-        reason,
-        user_agent: userAgent,
-        raw_request: rawRequest,
-      },
-    ]);
-  } catch (err) {
-    console.error("❌ Échec du log Supabase :", err);
-  }
-}
+// ✅ Routes vidéos centralisées
+import videosRoutes from "../routes/videos.routes.js";
 
-global.fetch = fetch;
-
-const execAsync = util.promisify(exec);
-const app = express();
-
-// 🔒 Middleware sécurité : vérifie la clé API dans le header
-function apiKeyMiddleware(req, res, next) {
-  const clientKey = req.headers["x-api-key"];
-
-  if (!clientKey) {
-    return res.status(401).json({ error: "Missing x-api-key header" });
-  }
-
-  if (clientKey !== process.env.API_SECRET) {
-    return res.status(401).json({ error: "Invalid API key" });
-  }
-
-  next();
-}
+// ✅ NEW (Étape 8): routes assets premium (bucket privé premium-assets)
+import assetsRoutes from "../routes/assets.routes.js";
 
 dotenv.config();
+global.fetch = fetch;
 
-if (!process.env.API_SECRET) {
-  console.error("❌ API_SECRET manquant dans les variables d'environnement.");
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+
+const stripe =
+  stripeSecretKey && stripeSecretKey.startsWith("sk_")
+    ? stripePackage(stripeSecretKey)
+    : null;
+
+// Si aucune clé Stripe valide → on désactive les paiements
+const PAYMENTS_ENABLED = false;
+
+if (!PAYMENTS_ENABLED) {
+  console.warn(
+    "⚠️ Stripe n'est pas configuré (STRIPE_SECRET_KEY manquant ou invalide). Les paiements réels sont désactivés, on utilisera le mode Premium gratuit."
+  );
+}
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ------------------------------------------------------
+// Vérifier les variables Supabase
+// ------------------------------------------------------
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error(
+    "❌ Erreur : SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY est manquant dans les variables d'environnement."
+  );
   process.exit(1);
 }
 
-console.log("🚀 Backend Grega Play lancé");
-console.log("Node version:", process.version);
-console.log("Process PID:", process.pid);
-console.log("ENV PORT:", process.env.PORT);
-
-process.on("uncaughtException", (err) => {
-  console.error("❌ uncaughtException:", err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("❌ unhandledRejection:", reason);
-});
-process.on("SIGTERM", () => {
-  console.warn("⚠️ SIGTERM reçu, le container va s’arrêter.");
-});
-
-// 🌍 Config CORS
-const allowedOrigins = [
-  "http://127.0.0.1:3000",
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "https://grega-play-frontend.vercel.app",
-  "https://gregaplay.com",
-];
-
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      console.warn("❌ Origin non autorisée :", origin);
-      return callback(null, false);
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
-    credentials: true,
-  })
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-app.options("*", cors());
+// ------------------------------------------------------
+// Création de l'application Express
+// ------------------------------------------------------
+const app = express();
 
-// 📋 Logger
+// ------------------------------------------------------
+// ✅ CORS
+// ------------------------------------------------------
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (!allowedOrigins.length) {
+  console.warn(
+    "⚠️ Aucun domaine CORS spécifié. Tous les domaines seront autorisés en mode développement."
+  );
+}
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (!allowedOrigins.length) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    console.warn(`❌ CORS bloqué pour l'origine : ${origin}`);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// ------------------------------------------------------
+// Logger global
+// ------------------------------------------------------
 app.use((req, res, next) => {
   console.log(
     `🌍 [${new Date().toISOString()}] ${req.method} ${req.originalUrl} | Origin: ${
@@ -135,980 +114,689 @@ app.use((req, res, next) => {
   );
   next();
 });
-app.use(express.json());
 
-// 📂 Résolution chemins
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// 📂 Répertoire temporaire
-const tmp = path.join(__dirname, "tmp");
-if (!fs.existsSync(tmp)) {
-  fs.mkdirSync(tmp);
-}
-
-// 🔐 Règles et helper pour la sécurité des fichiers vidéo
-const ALLOWED_MIME_TYPES = ["video/mp4", "video/quicktime"];
-const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 Mo
-
-function sanitizeFileName(originalName) {
-  if (!originalName || typeof originalName !== "string") {
-    return "video.mp4";
+// ⚠️ On n'utilise PAS express.json() pour /webhooks/stripe (raw body requis).
+app.use((req, res, next) => {
+  if (req.originalUrl === "/webhooks/stripe") {
+    next();
+  } else {
+    express.json()(req, res, next);
   }
-
-  const lastDotIndex = originalName.lastIndexOf(".");
-  const baseName =
-    lastDotIndex > -1 ? originalName.slice(0, lastDotIndex) : originalName;
-  const extension =
-    lastDotIndex > -1 ? originalName.slice(lastDotIndex) : ".mp4";
-
-  const safeBase =
-    baseName
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "") // enlève les accents
-      .replace(/[^a-zA-Z0-9]+/g, "-") // remplace tout ce qui n’est pas alphanumérique
-      .replace(/^-+|-+$/g, "") // supprime les "-" au début/fin
-      .substring(0, 50) || "video";
-
-  return `${safeBase}${extension}`;
-}
-
-// ⚙️ Multer
-const upload = multer({
-  dest: tmp,
-  limits: { fileSize: MAX_FILE_SIZE_BYTES }, // 50 MB
 });
 
-// 🔑 Supabase client
-console.log("🔑 Vérification variables d'environnement :");
-console.log(
-  "   SUPABASE_URL:",
-  process.env.SUPABASE_URL ? "OK" : "❌ MISSING"
-);
-console.log(
-  "   SUPABASE_SERVICE_ROLE_KEY:",
-  process.env.SUPABASE_SERVICE_ROLE_KEY ? "OK" : "❌ MISSING"
+// ------------------------------------------------------
+// ✅ Helpers sécurité HTML (pour OG tags)
+// ------------------------------------------------------
+function escapeHtml(str = "") {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+function escapeAttr(str = "") {
+  return escapeHtml(str);
+}
+
+// Helpers pour SVG (OG image)
+function escapeXml(str = "") {
+  return String(str)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+// Wrap simple : découpe en lignes sans mesurer au pixel (suffisant pour V1)
+function svgMultilineText(text, x, y, fontSize, lineHeight, maxLines) {
+  const clean = escapeXml(text).trim();
+  const words = clean.split(/\s+/);
+  const lines = [];
+  let current = "";
+
+  const approxCharsPerLine = 24; // ajuste si tu changes fontSize
+  for (const w of words) {
+    const test = current ? `${current} ${w}` : w;
+    if (test.length > approxCharsPerLine && current) {
+      lines.push(current);
+      current = w;
+    } else {
+      current = test;
+    }
+  }
+  if (current) lines.push(current);
+
+  const finalLines = lines.slice(0, maxLines);
+  if (lines.length > maxLines) {
+    finalLines[maxLines - 1] =
+      finalLines[maxLines - 1].replace(/\.*$/, "") + "…";
+  }
+
+  const tspans = finalLines
+    .map(
+      (line, i) =>
+        `<tspan x="${x}" dy="${i === 0 ? 0 : lineHeight}">${line}</tspan>`
+    )
+    .join("");
+
+  return `
+  <text x="${x}" y="${y}" fill="#fff" font-size="${fontSize}"
+        font-family="Arial, Helvetica, sans-serif" font-weight="900">
+    ${tspans}
+  </text>`;
+}
+
+function getPublicSiteUrl(req) {
+  // 1) Priorité à la variable d'env (recommandé en prod)
+  const envUrl = (process.env.PUBLIC_SITE_URL || "").trim();
+  if (envUrl) return envUrl.replace(/\/+$/, "");
+
+  // 2) Fallback basé sur la requête (utile en dev / tunnel)
+  const proto =
+    (req.headers["x-forwarded-proto"] || req.protocol || "http")
+      .toString()
+      .split(",")[0]
+      .trim();
+
+  const host = (req.headers["x-forwarded-host"] || req.headers.host || "")
+    .toString()
+    .split(",")[0]
+    .trim();
+
+  if (!host) return "";
+  return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
+// ------------------------------------------------------
+// ✅ Middleware de sécurité minimal : clé API backend
+// ------------------------------------------------------
+const apiKeyMiddleware = (req, res, next) => {
+  if (req.method === "OPTIONS") return next();
+
+  const incomingKey = req.headers["x-api-key"];
+  const expectedKey = process.env.INTERNAL_API_KEY;
+
+  if (!expectedKey || incomingKey !== expectedKey) {
+    console.warn(
+      "❌ Requête API refusée (mauvaise clé API) sur",
+      req.method,
+      req.originalUrl
+    );
+    return res
+      .status(403)
+      .json({ error: "Accès non autorisé (clé API invalide)." });
+  }
+
+  next();
+};
+
+// ------------------------------------------------------
+// 🟣 Webhook Stripe (RAW body obligatoire)
+// ------------------------------------------------------
+app.post(
+  "/webhooks/stripe",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!PAYMENTS_ENABLED) {
+      console.warn("⚠️ Webhook Stripe reçu alors que PAYMENTS_ENABLED = false.");
+      return res.status(200).send("Stripe désactivé, webhook ignoré.");
+    }
+
+    const sig = req.headers["stripe-signature"];
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("❌ Erreur de vérification du webhook Stripe:", err);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    console.log(`📦 Webhook Stripe reçu: ${event.type}`);
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed":
+          await handleCheckoutSessionCompleted(event.data.object);
+          break;
+        case "invoice.paid":
+          console.log("✅ invoice.paid reçu (abonnement actif)");
+          break;
+        case "invoice.payment_failed":
+          console.warn("⚠️ invoice.payment_failed reçu (paiement échoué)");
+          break;
+        default:
+          console.log(`ℹ️ Événement Stripe non géré: ${event.type}`);
+      }
+    } catch (err) {
+      console.error("❌ Erreur lors du traitement du webhook Stripe:", err);
+      return res
+        .status(500)
+        .send("Erreur interne lors du traitement du webhook");
+    }
+
+    res.json({ received: true });
+  }
 );
 
-const supabase = createClient(
-  process.env.SUPABASE_URL || "",
-  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
-);
+// Fonction de traitement pour "checkout.session.completed"
+async function handleCheckoutSessionCompleted(session) {
+  if (!session || !session.metadata) {
+    console.warn(
+      "⚠️ Session Stripe sans metadata. Impossible de savoir quel type de produit."
+    );
+    return;
+  }
 
-// 🔄 Helper pour extraire bucket + path à partir d’une URL publique Supabase
-function extractStorageInfoFromPublicUrl(publicUrl) {
+  const metadata = session.metadata;
+  const mode = metadata.mode;
+  const userId = metadata.user_id;
+
+  if (!userId) {
+    console.warn("⚠️ Session Stripe sans user_id dans les metadata.");
+    return;
+  }
+
+  console.log(
+    `✅ checkout.session.completed pour user ${userId}, mode=${mode}, session=${session.id}`
+  );
+
+  if (mode === "account") {
+    const amountTotal = session.amount_total || 0;
+    const currency = session.currency || "eur";
+
+    const nowIso = new Date().toISOString();
+    const periodEndIso = null;
+
+    const { error: profileError } = await supabase
+      .from("profiles")
+      .update({
+        is_premium_account: true,
+        premium_account_plan: "premium-account",
+        premium_account_expires_at: periodEndIso,
+      })
+      .eq("id", userId);
+
+    if (profileError) {
+      console.error("❌ Erreur update profil Premium (Stripe):", profileError);
+      return;
+    }
+
+    const { error: insertError } = await supabase
+      .from("account_subscriptions")
+      .insert({
+        user_id: userId,
+        provider: "stripe",
+        provider_subscription_id: session.subscription || null,
+        status: "active",
+        plan: "premium-account",
+        amount_cents: amountTotal,
+        currency: currency.toUpperCase(),
+        current_period_start: nowIso,
+        current_period_end: periodEndIso,
+      });
+
+    if (insertError) {
+      console.error("⚠️ Erreur insert account_subscriptions:", insertError);
+    }
+  } else if (mode === "event") {
+    const eventId = metadata.event_id;
+    if (!eventId) {
+      console.warn(
+        "⚠️ Session Stripe mode=event sans event_id dans les metadata."
+      );
+      return;
+    }
+
+    const { data: updatedEvent, error: eventUpdateError } = await supabase
+      .from("events")
+      .update({
+        is_premium_event: true,
+      })
+      .eq("id", eventId)
+      .eq("user_id", userId)
+      .select()
+      .single();
+
+    if (eventUpdateError) {
+      console.error(
+        "❌ Erreur update events (Premium via Stripe):",
+        eventUpdateError
+      );
+      return;
+    }
+
+    console.log("✅ Événement mis à jour en Premium via Stripe:", updatedEvent);
+  } else {
+    console.log("ℹ️ Mode de checkout inconnu, aucune action:", mode);
+  }
+}
+
+// ------------------------------------------------------
+// ✅ Routes (avant /api, si publiques)
+// ------------------------------------------------------
+app.use(capabilitiesRoutes);
+
+// ------------------------------------------------------
+// ✅ OG IMAGE dynamique (publique)
+// URL : /og/event/:public_code.png
+// ------------------------------------------------------
+app.get("/og/event/:public_code.png", async (req, res) => {
   try {
-    if (!publicUrl || !process.env.SUPABASE_URL) return null;
-    const base = `${process.env.SUPABASE_URL}/storage/v1/object/public/`;
-    if (!publicUrl.startsWith(base)) return null;
+    const { public_code } = req.params;
 
-    const rel = publicUrl.slice(base.length); // ex: "final-videos/event-123/file.mp4"
-    const firstSlash = rel.indexOf("/");
-    if (firstSlash === -1) return null;
+    const { data: event, error } = await supabase
+      .from("events")
+      .select("title, theme")
+      .eq("public_code", public_code)
+      .single();
 
-    const bucket = rel.slice(0, firstSlash);
-    const path = rel.slice(firstSlash + 1);
+    if (error || !event) return res.status(404).send("Not found");
 
-    if (!bucket || !path) return null;
-    return { bucket, path };
-  } catch {
+    const title = (event.title || "Événement").trim();
+    const theme = (event.theme || "").trim();
+
+    // Dimensions OG recommandées
+    const W = 1200;
+    const H = 630;
+
+    // Palette (V1)
+    const bg1 = "#0B1220";
+    const bg2 = "#111827";
+    const accent = "#10B981"; // vert Grega Play-like
+
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="${bg1}"/>
+      <stop offset="1" stop-color="${bg2}"/>
+    </linearGradient>
+
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect width="${W}" height="${H}" fill="url(#g)"/>
+
+  <!-- Accent shapes -->
+  <circle cx="980" cy="120" r="180" fill="${accent}" opacity="0.18"/>
+  <circle cx="1100" cy="520" r="260" fill="${accent}" opacity="0.12"/>
+  <rect x="70" y="460" width="1060" height="6" fill="${accent}" opacity="0.55"/>
+
+  <!-- Card -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="90" rx="28" ry="28" width="1060" height="360" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)"/>
+  </g>
+
+  <!-- Branding -->
+  <text x="110" y="150" fill="rgba(255,255,255,0.85)" font-size="34" font-family="Arial, Helvetica, sans-serif" font-weight="700">
+    Grega Play
+  </text>
+
+  <!-- Title -->
+  ${svgMultilineText(title, 110, 220, 58, 44, 3)}
+
+  <!-- Theme -->
+  <text x="110" y="420" fill="rgba(255,255,255,0.72)" font-size="28" font-family="Arial, Helvetica, sans-serif">
+    ${escapeXml(theme ? `Thème : ${theme}` : "Participe et ajoute ta vidéo")}
+  </text>
+
+  <!-- Footer -->
+  <text x="110" y="560" fill="rgba(255,255,255,0.65)" font-size="24" font-family="Arial, Helvetica, sans-serif">
+    Une vidéo collective, créée ensemble.
+  </text>
+
+  <!-- Badge -->
+  <g>
+    <rect x="930" y="520" rx="18" ry="18" width="200" height="54" fill="${accent}" opacity="0.95"/>
+    <text x="1030" y="556" text-anchor="middle" fill="#062014" font-size="24" font-family="Arial, Helvetica, sans-serif" font-weight="800">
+      Ouvrir
+    </text>
+  </g>
+</svg>`;
+
+    const pngBuffer = await sharp(Buffer.from(svg)).png({ quality: 90 }).toBuffer();
+
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=3600"); // 1h
+    return res.status(200).send(pngBuffer);
+  } catch (e) {
+    console.error("❌ OG image error:", e);
+    return res.status(500).send("Server error");
+  }
+});
+
+// ------------------------------------------------------
+// ✅ Page publique serveur pour preview WhatsApp / Instagram-like
+// URL à partager : https://ton-domaine/share/e/:public_code
+// ------------------------------------------------------
+app.get("/share/e/:public_code", async (req, res) => {
+  try {
+    const { public_code } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select("title, description, theme, public_code, cover_url")
+      .eq("public_code", public_code)
+      .single();
+
+    if (error || !event) {
+      console.warn("❌ /share/e/:public_code introuvable:", error);
+      return res.status(404).send("Not found");
+    }
+
+    const siteUrl = getPublicSiteUrl(req); // PUBLIC_SITE_URL recommandé
+    const appUrl = siteUrl ? `${siteUrl}/e/${public_code}` : `/e/${public_code}`;
+
+    const ogTitle = `🎉 ${event.title || "Événement"} – Grega Play`;
+    const ogDesc =
+      (event.description || "").trim() ||
+      "Participe à cet événement et ajoute ta vidéo souvenir.";
+
+    // ✅ Priorité à l'image dynamique par événement
+    // (si tu veux forcer cover_url uploadée, mets cover_url en priorité)
+    const ogImage = siteUrl
+      ? `${siteUrl}/og/event/${public_code}.png`
+      : "";
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    return res.status(200).send(`<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <title>${escapeHtml(ogTitle)}</title>
+
+  <meta property="og:title" content="${escapeAttr(ogTitle)}" />
+  <meta property="og:description" content="${escapeAttr(ogDesc)}" />
+  ${ogImage ? `<meta property="og:image" content="${escapeAttr(ogImage)}" />` : ""}
+  <meta property="og:url" content="${escapeAttr(appUrl)}" />
+  <meta property="og:type" content="website" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${escapeAttr(ogTitle)}" />
+  <meta name="twitter:description" content="${escapeAttr(ogDesc)}" />
+  ${ogImage ? `<meta name="twitter:image" content="${escapeAttr(ogImage)}" />` : ""}
+
+  <meta http-equiv="refresh" content="0;url=${escapeAttr(appUrl)}" />
+</head>
+<body>
+  Redirection… <a href="${escapeAttr(appUrl)}">Ouvrir l’événement</a>
+</body>
+</html>`);
+  } catch (e) {
+    console.error("❌ Erreur /share/e/:public_code:", e);
+    return res.status(500).send("Server error");
+  }
+});
+
+// (optionnel) si tu utilises ces routes sans clé API, déplace-les avant /api
+// app.use("/notifications", notificationsRouter);
+// app.use("/auth/whatsapp", whatsappAuthRoutes);
+
+// ------------------------------------------------------
+// Toutes les routes en /api nécessitent une clé API
+// ------------------------------------------------------
+app.use("/api", apiKeyMiddleware);
+
+// ✅ Étape 8: assets premium (upload privé + storagePath)
+app.use("/api/assets", assetsRoutes);
+
+// 📧 Routes email
+app.use("/api/email", emailRoutes);
+
+// ✅ events routes
+app.use("/api/events", eventsRoutes);
+
+// 💳 billing routes
+app.use("/api/billing", billingRoutes);
+
+// ✅ vidéos centralisées (upload/process/process-async/jobs)
+app.use("/api/videos", videosRoutes);
+
+// ------------------------------------------------------
+// 🧩 Helper : extraire bucket + path depuis une URL publique Supabase
+// (utilisé ici pour la suppression complète d'événement)
+// ------------------------------------------------------
+function getBucketAndPathFromPublicUrl(publicUrl) {
+  if (!publicUrl || typeof publicUrl !== "string") return null;
+
+  try {
+    const url = new URL(publicUrl);
+    const marker = "/object/public/";
+    const idx = url.pathname.indexOf(marker);
+    if (idx === -1) return null;
+
+    const after = url.pathname.substring(idx + marker.length);
+    const parts = after.split("/");
+    if (parts.length < 2) return null;
+
+    const bucket = parts[0];
+    const pathInBucket = parts.slice(1).join("/");
+
+    return { bucket, path: pathInBucket };
+  } catch (e) {
+    console.warn("⚠️ Impossible de parser l'URL publique Supabase:", publicUrl, e);
     return null;
   }
 }
 
-// 🔔 Notifs : helper quand une nouvelle vidéo est envoyée (créateur uniquement)
-async function notifyEventOwnerOnNewVideo(eventId, participantName) {
-  try {
-    const { data: events, error: eventError } = await supabase
-      .from("events")
-      .select("user_id, title, enable_notifications") // prise en compte du toggle
-      .eq("id", eventId)
-      .limit(1);
-
-    if (eventError || !events || events.length === 0) {
-      console.warn(
-        "⚠️ Impossible de récupérer l'événement pour la notif (nouvelle vidéo):",
-        eventError
-      );
-      return;
-    }
-
-    const event = events[0];
-
-    // respect du choix du créateur
-    if (event.enable_notifications === false) {
-      console.log(
-        `ℹ️ Notifications désactivées pour l'événement ${eventId} (nouvelle vidéo), aucun envoi.`
-      );
-      return;
-    }
-
-    const { data: subs, error: subsError } = await supabase
-      .from("notification_subscriptions")
-      .select("*")
-      .eq("user_id", event.user_id);
-
-    if (subsError || !subs || subs.length === 0) {
-      console.log(
-        "ℹ️ Aucun abonnement push pour ce créateur (nouvelle vidéo), aucun envoi."
-      );
-      return;
-    }
-
-    const payload = {
-      title: "Nouvelle vidéo reçue 🎬",
-      body: `${participantName} a envoyé une vidéo pour l'événement "${event.title}".`,
-      url: `https://gregaplay.com/dashboard`,
-    };
-
-    for (const sub of subs) {
-      const subscription = {
-        endpoint: sub.endpoint,
-        keys: {
-          p256dh: sub.p256dh,
-          auth: sub.auth,
-        },
-      };
-
-      try {
-        await sendPushNotification(subscription, payload);
-      } catch (err) {
-        console.error("❌ Erreur envoi push (nouvelle vidéo):", err);
-      }
-    }
-  } catch (err) {
-    console.error("❌ Erreur notifyEventOwnerOnNewVideo:", err);
-  }
-}
-
-// 🔔 Notifs : helper quand la vidéo finale est prête (créateur + invités)
-async function notifyEventUsersOnFinalVideo(eventId, finalVideoUrl) {
-  try {
-    // 1) Récupérer l'événement (créateur + titre + choix notifs)
-    const { data: events, error: eventError } = await supabase
-      .from("events")
-      .select("id, user_id, title, enable_notifications")
-      .eq("id", eventId)
-      .limit(1);
-
-    if (eventError || !events || events.length === 0) {
-      console.warn(
-        "⚠️ Impossible de récupérer l'événement pour la notif (vidéo finale):",
-        eventError
-      );
-      return;
-    }
-
-    const event = events[0];
-
-    // notifications désactivées pour cet event
-    if (event.enable_notifications === false) {
-      console.log(
-        `ℹ️ Notifications désactivées pour l'événement ${eventId} (vidéo finale), aucun envoi.`
-      );
-      return;
-    }
-
-    // 2) Récupérer les invités (participants) de l'événement
-    const { data: participants, error: participantsError } = await supabase
-      .from("event_participants")
-      .select("user_id")
-      .eq("event_id", eventId)
-      .eq("status", "accepted");
-
-    if (participantsError) {
-      console.error(
-        "❌ Erreur récupération participants pour notif vidéo finale:",
-        participantsError
-      );
-    }
-
-    const participantUserIds = (participants || []).map((p) => p.user_id);
-
-    // 3) Construire la liste de tous les user_ids à notifier (créateur + invités)
-    const allUserIds = Array.from(
-      new Set([event.user_id, ...participantUserIds])
-    );
-
-    if (allUserIds.length === 0) {
-      console.log(
-        "ℹ️ Aucun utilisateur à notifier pour cette vidéo finale (liste userIds vide)."
-      );
-      return;
-    }
-
-    // 4) Récupérer toutes les subscriptions de ces users
-    const { data: subs, error: subsError } = await supabase
-      .from("notification_subscriptions")
-      .select("*")
-      .in("user_id", allUserIds);
-
-    if (subsError || !subs || subs.length === 0) {
-      console.log(
-        "ℹ️ Aucun abonnement push trouvé pour ces utilisateurs (vidéo finale)."
-      );
-      return;
-    }
-
-    // 5) Envoyer la notif adaptée à chacun
-    for (const sub of subs) {
-      const isOwner = sub.user_id === event.user_id;
-
-      const payload = isOwner
-        ? {
-            title: "Ta vidéo finale est prête 🎉",
-            body: `La vidéo finale de l'événement "${event.title}" est maintenant disponible.`,
-            url: finalVideoUrl || "https://gregaplay.com/dashboard",
-          }
-        : {
-            title: "La vidéo finale est prête 🎉",
-            body: `La vidéo finale de l'événement "${event.title}" est prête. Le créateur pourra te la partager bientôt.`,
-            url: "https://gregaplay.com/dashboard",
-          };
-
-      const subscription = {
-        endpoint: sub.endpoint,
-        keys: {
-          p256dh: sub.p256dh,
-          auth: sub.auth,
-        },
-      };
-
-      try {
-        await sendPushNotification(subscription, payload);
-      } catch (err) {
-        console.error("❌ Erreur envoi push (vidéo finale - user):", err);
-      }
-    }
-  } catch (err) {
-    console.error("❌ Erreur notifyEventUsersOnFinalVideo:", err);
-  }
-}
-
-// Routes notifications (pas protégées par x-api-key)
-app.use("/api/notifications", notificationsRouter);
-
-// ======================================================
-// 🚑 Route de test
-// ======================================================
-app.get("/ping", (req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
-});
-
-// ======================================================
-// ✅ Route publique pour la vidéo finale (lien propre)
-// ======================================================
-app.get("/api/public/final-video/:publicCode", async (req, res) => {
-  try {
-    const { publicCode } = req.params;
-
-    const { data: event, error } = await supabase
-      .from("events")
-      .select(
-        `
-        id,
-        title,
-        description,
-        theme,
-        deadline,
-        final_video_url,
-        status,
-        user_id
-      `
-      )
-      .eq("public_code", publicCode)
-      .single();
-
-    if (error || !event) {
-      console.error(
-        "❌ Événement introuvable pour public_code:",
-        publicCode,
-        error
-      );
-      return res.status(404).json({ message: "Événement introuvable" });
-    }
-
-    if (!event.final_video_url) {
-      return res
-        .status(400)
-        .json({ message: "La vidéo finale n’est pas encore disponible." });
-    }
-
-    return res.json({
-      title: event.title,
-      description: event.description,
-      theme: event.theme,
-      deadline: event.deadline,
-      finalVideoUrl: event.final_video_url,
-    });
-  } catch (err) {
-    console.error("❌ Erreur route /api/public/final-video :", err);
-    return res.status(500).json({ message: "Erreur serveur" });
-  }
-});
-
-// ======================================================
-// ✅ Helper : récupérer la durée avec ffprobe
-// ======================================================
-async function getVideoDuration(filePath) {
-  const cmd = `ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`;
-  const { stdout } = await execAsync(cmd);
-  return parseFloat(stdout);
-}
-
-// ======================================================
-// 📱 Routes OTP WhatsApp (publiques, pas de x-api-key)
-// ======================================================
-app.use("/auth", whatsappAuthRoutes);
-
-// ======================================================
-// ✅ Upload + compression vidéo avec limite 30s
-// ======================================================
-// 🔒 Toutes les routes /api doivent avoir x-api-key
-app.use("/api", apiKeyMiddleware);
-
-// 📧 Routes email (protégées par x-api-key)
-app.use("/api/email", emailRoutes);
-
-app.post(
-  "/api/videos/upload-and-compress",
-  upload.single("file"),
-  async (req, res) => {
-    const { eventId, participantName } = req.body;
-    const file = req.file;
-
-    // 🔍 Validations de base sur les champs
-    if (!eventId || typeof eventId !== "string") {
-      return res.status(400).json({ error: "eventId manquant ou invalide" });
-    }
-
-    if (!participantName || typeof participantName !== "string") {
-      return res
-        .status(400)
-        .json({ error: "participantName manquant ou invalide" });
-    }
-
-    if (!file) {
-      await logRejectedUpload({
-        req,
-        reason: "fichier_absent",
-        eventId,
-        participantName,
-      });
-      return res.status(400).json({ error: "Aucun fichier reçu" });
-    }
-
-    // 🔎 Taille excessive (défense supplémentaire, même si Multer limite déjà)
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      await logRejectedUpload({
-        req,
-        reason: "taille_excessive",
-        file,
-        eventId,
-        participantName,
-      });
-      return res.status(400).json({
-        error: "Fichier trop volumineux (taille maximale 50 Mo).",
-      });
-    }
-
-    // 🎯 Filtrage strict des types MIME autorisés
-    if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-      await logRejectedUpload({
-        req,
-        reason: "type_non_autorisé",
-        file,
-        eventId,
-        participantName,
-      });
-
-      return res.status(400).json({
-        error: "Type de fichier non autorisé. Formats acceptés : MP4, MOV.",
-      });
-    }
-
-    // 🔒 Vérifier si le participant est le créateur OU un invité (sauf si événement public)
-    try {
-      const participantEmailNorm = participantName.trim().toLowerCase();
-
-      // 1) Récupérer l'événement pour connaître le user_id du créateur + visibilité
-      const { data: eventRow, error: eventErr } = await supabase
-        .from("events")
-        .select("id, user_id, is_public")
-        .eq("id", eventId)
-        .single();
-
-      if (eventErr || !eventRow) {
-        console.error("❌ Erreur récupération event pour vérif créateur:", eventErr);
-        return res
-          .status(404)
-          .json({ error: "Événement introuvable pour le contrôle d’invitation." });
-      }
-
-      const isPublicEvent = eventRow.is_public === true;
-
-      // 👉 Si l'événement est public : on laisse passer tout le monde
-      if (!isPublicEvent) {
-        // 2) Récupérer l'email du créateur dans profiles
-        const { data: ownerProfile, error: ownerErr } = await supabase
-          .from("profiles")
-          .select("email")
-          .eq("id", eventRow.user_id)
-          .single();
-
-        if (ownerErr) {
-          console.error("❌ Erreur récupération profil créateur:", ownerErr);
-        }
-
-        let isCreator = false;
-        if (ownerProfile?.email) {
-          const ownerEmailNorm = ownerProfile.email.trim().toLowerCase();
-          isCreator = ownerEmailNorm === participantEmailNorm;
-        }
-
-        if (!isCreator) {
-          // 3) Si ce n'est pas le créateur → vérifier s'il est invité
-          const { data: invites, error: inviteErr } = await supabase
-            .from("invitations")
-            .select("email")
-            .eq("event_id", eventId)
-            .eq("email", participantName);
-
-          if (inviteErr) {
-            console.error("❌ Erreur vérification invitation:", inviteErr);
-            return res
-              .status(500)
-              .json({ error: "Erreur interne (invitation check)" });
-          }
-
-          if (!invites || invites.length === 0) {
-            await logRejectedUpload({
-              req,
-              reason: "non_invité",
-              file,
-              eventId,
-              participantName,
-            });
-
-            return res.status(403).json({
-              error: "NOT_INVITED",
-              message:
-                "Tu n'as pas été invité à cet événement. Impossible d'envoyer une vidéo.",
-            });
-          }
-        }
-      }
-    } catch (err) {
-      console.error("❌ Erreur inattendue vérification créateur/invitation:", err);
-      return res
-        .status(500)
-        .json({ error: "Erreur interne lors du contrôle d'invitation." });
-    }
-
-    // 🔒 Contrôle : 1 seule vidéo par participant sur compte gratuit
-    try {
-      const { data: existingVideos, error: existingError } = await supabase
-        .from("videos")
-        .select("id")
-        .eq("event_id", eventId)
-        .eq("participant_name", participantName);
-
-      if (existingError) {
-        console.error("❌ Erreur contrôle quota vidéos:", existingError);
-        return res.status(500).json({
-          error: "Erreur interne lors du contrôle du quota.",
-        });
-      }
-
-      const isPremium = false; // sera branché plus tard sur un vrai statut Premium
-
-      if (!isPremium && existingVideos && existingVideos.length >= 1) {
-        await logRejectedUpload({
-          req,
-          reason: "quota_free_max_1_video",
-          file,
-          eventId,
-          participantName,
-        });
-
-        return res.status(403).json({
-          error: "MAX_FREE_VIDEOS_PER_EVENT_REACHED",
-          message:
-            "Avec un compte gratuit, tu peux envoyer une seule vidéo par événement. Passe en Premium pour en ajouter d'autres.",
-        });
-      }
-    } catch (err) {
-      console.error("❌ Erreur inattendue contrôle quota:", err);
-      return res.status(500).json({
-        error: "Erreur interne lors du contrôle du quota.",
-      });
-    }
-
-    // 🧼 Normalisation du nom de fichier
-    const safeOriginalName = sanitizeFileName(file.originalname || "video.mp4");
-
-    const rawPath = path.join(tmp, `raw-${Date.now()}-${safeOriginalName}`);
-    const compressedPath = path.join(
-      tmp,
-      `compressed-${Date.now()}-${safeOriginalName}`
-    );
-
-    try {
-      fs.copyFileSync(file.path, rawPath);
-
-      // ✅ Vérifier durée max (30s)
-      const duration = await getVideoDuration(rawPath);
-      console.log(`🎞️ Durée détectée: ${duration}s`);
-      if (duration > 30) {
-        await logRejectedUpload({
-          req,
-          reason: "durée_excessive",
-          file,
-          eventId,
-          participantName,
-          duration,
-        });
-
-        fs.unlinkSync(rawPath);
-        fs.unlinkSync(file.path);
-        return res.status(400).json({
-          error:
-            "⛔ La vidéo dépasse la durée maximale autorisée (30 secondes).",
-        });
-      }
-
-      // Compression si durée ok
-      const cmd = `ffmpeg -y -i "${rawPath}" -vf "scale=640:-2" -b:v 800k -preset ultrafast "${compressedPath}"`;
-      await execAsync(cmd);
-
-      const buffer = fs.readFileSync(compressedPath);
-      const filename = `compressed/${eventId}/${Date.now()}-${safeOriginalName}`;
-
-      const { error: uploadError } = await supabase.storage
-        .from("videos")
-        .upload(filename, buffer, {
-          contentType: "video/mp4",
-          upsert: true,
-        });
-      if (uploadError) throw uploadError;
-
-      const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/videos/${filename}`;
-
-      const { data: insertData, error: insertError } = await supabase
-        .from("videos")
-        .insert([
-          {
-            event_id: eventId,
-            participant_name: participantName,
-            storage_path: filename,
-            video_url: publicUrl,
-          },
-        ])
-        .select();
-      if (insertError) throw insertError;
-
-      // Nettoyage
-      fs.unlinkSync(rawPath);
-      fs.unlinkSync(compressedPath);
-      fs.unlinkSync(file.path);
-
-      // 🔔 Notifier le créateur de l'évènement (nouvelle vidéo)
-      notifyEventOwnerOnNewVideo(eventId, participantName).catch((err) =>
-        console.error("❌ Erreur notif nouvelle vidéo:", err)
-      );
-
-      res.status(200).json(insertData[0]);
-    } catch (err) {
-      console.error("❌ Erreur upload vidéo :", err);
-      res.status(500).json({ error: "Erreur lors de l'upload vidéo" });
-    }
-  }
-);
-
-// ======================================================
-// ✅ Récupérer les vidéos par événement
-// ======================================================
-app.get("/api/videos", async (req, res) => {
-  const { eventId } = req.query;
-
-  try {
-    const { data, error } = await supabase
-      .from("videos")
-      .select("*")
-      .eq("event_id", eventId)
-      .order("created_at", { ascending: true });
-    if (error) throw error;
-
-    res.status(200).json(data);
-  } catch (err) {
-    console.error("❌ Erreur récupération vidéos :", err);
-    res.status(500).json({ error: "Erreur récupération vidéos" });
-  }
-});
-
-// ======================================================
-// ✅ Supprimer une vidéo
-// ======================================================
-app.delete("/api/videos/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const { data, error } = await supabase
-      .from("videos")
-      .delete()
-      .eq("id", id)
-      .select();
-    if (error) throw error;
-
-    res.status(200).json(data[0]);
-  } catch (err) {
-    console.error("❌ Erreur suppression vidéo :", err);
-    res.status(500).json({ error: "Erreur suppression vidéo" });
-  }
-});
-
-// ======================================================
-// ✅ Générer la vidéo finale (avec sélection 2–5 vidéos)
-// ======================================================
-app.post("/api/videos/process", async (req, res) => {
-  const { eventId, selectedVideoIds } = req.body;
-
-  if (!eventId) {
-    return res.status(400).json({ error: "eventId manquant" });
-  }
-
-  // Règle gratuite : 2 à 5 vidéos sélectionnées
-  if (!Array.isArray(selectedVideoIds) || selectedVideoIds.length < 2) {
-    return res.status(400).json({
-      error: "Sélectionne au moins 2 vidéos pour générer la vidéo finale.",
-    });
-  }
-
-  const isPremium = false; // sera branché plus tard sur un vrai statut Premium
-
-  if (!isPremium && selectedVideoIds.length > 5) {
-    return res.status(400).json({
-      error:
-        "La version gratuite permet d'utiliser au maximum 5 vidéos. Passe à un compte Premium pour en utiliser davantage.",
-    });
-  }
-
-  try {
-    const { default: processVideo } = await import("./processVideo.js");
-    const finalVideoUrl = await processVideo(eventId, selectedVideoIds);
-
-    // 🔔 Notifier le créateur + les invités quand la vidéo finale est prête
-    notifyEventUsersOnFinalVideo(eventId, finalVideoUrl).catch((err) =>
-      console.error("❌ Erreur notif vidéo finale:", err)
-    );
-
-    return res.status(200).json({ finalVideoUrl: finalVideoUrl });
-  } catch (err) {
-    console.error("❌ Erreur génération vidéo finale :", err);
-    return res.status(500).json({
-      error: err.message || "Erreur lors de la génération de la vidéo finale",
-    });
-  }
-});
-
-// ======================================================
-// ✅ Statistiques par événement (invitations / vidéos)
-// ======================================================
-app.get("/api/events/:eventId/stats", async (req, res) => {
-  const { eventId } = req.params;
-
-  try {
-    // Invitations pour cet événement
-    const { data: invitations, error: invError } = await supabase
-      .from("invitations")
-      .select("email")
-      .eq("event_id", eventId);
-
-    if (invError) {
-      console.error("❌ Erreur récupération invitations pour stats:", invError);
-      return res.status(500).json({ error: "Erreur récupération invitations" });
-    }
-
-    // Vidéos reçues pour cet événement
-    const { data: videos, error: vidError } = await supabase
-      .from("videos")
-      .select("participant_name")
-      .eq("event_id", eventId);
-
-    if (vidError) {
-      console.error("❌ Erreur récupération vidéos pour stats:", vidError);
-      return res.status(500).json({ error: "Erreur récupération vidéos" });
-    }
-
-    const totalInvitations = invitations?.length || 0;
-    const participantsWithVideo = new Set(
-      (videos || []).map((v) => v.participant_name)
-    );
-
-    // Hypothèse : participant_name = email invité
-    const totalWithVideo = (invitations || []).filter((inv) =>
-      participantsWithVideo.has(inv.email)
-    ).length;
-
-    const totalPending = totalInvitations - totalWithVideo;
-
-    return res.json({
-      totalInvitations,
-      totalWithVideo,
-      totalPending,
-    });
-  } catch (err) {
-    console.error("❌ Erreur /api/events/:eventId/stats :", err);
-    return res.status(500).json({ error: "Erreur serveur stats événement" });
-  }
-});
-
-// ======================================================
-// ✅ Route de relance manuelle des participants
-// ======================================================
+// ------------------------------------------------------
+// 🔔 Relance des participants à J-1 de la deadline
+// ------------------------------------------------------
 app.post("/api/events/:eventId/remind", async (req, res) => {
   const { eventId } = req.params;
 
   try {
-    // 1. Charger l’évènement
-    const { data: event, error: eventErr } = await supabase
+    const { data: event, error: eventError } = await supabase
       .from("events")
-      .select("title, deadline, user_id")
+      .select("id, title, description, deadline, user_id")
       .eq("id", eventId)
       .single();
 
-    if (eventErr || !event) {
-      return res.status(404).json({ error: "Event introuvable" });
+    if (eventError || !event) {
+      console.error("❌ Événement introuvable pour relance:", eventError);
+      return res.status(404).json({ error: "Événement introuvable." });
     }
 
-    // 2. Récupérer les invitations
-    const { data: invitations, error: invErr } = await supabase
-      .from("invitations")
-      .select("email, id")
+    const { data: participants, error: participantsError } = await supabase
+      .from("event_participants")
+      .select("email, name, has_submitted")
       .eq("event_id", eventId);
 
-    if (invErr) throw invErr;
-
-    // 3. Récupérer les vidéos existantes
-    const { data: videos, error: vidErr } = await supabase
-      .from("videos")
-      .select("participant_name")
-      .eq("event_id", eventId);
-
-    if (vidErr) throw vidErr;
-
-    const participantsWhoSent = videos.map((v) => v.participant_name);
-
-    // 4. Filtrer les invités sans vidéo
-    const pendingInvitations = invitations.filter(
-      (inv) => !participantsWhoSent.includes(inv.email)
-    );
-
-    // 5. Envoyer les relances email
-    for (const inv of pendingInvitations) {
-      await emailService.sendMail({
-        to: inv.email,
-        subject: `Rappel : Il ne te reste plus beaucoup de temps pour participer à "${event.title}"`,
-        text: `Il ne manque plus que ta vidéo.`,
-        html: `
-         <div style="font-family: Inter, Arial, sans-serif; background:#f4f6f9; padding:32px;">
-    <div style="
-      max-width:600px;
-      margin:auto;
-      background:#ffffff;
-      border-radius:18px;
-      overflow:hidden;
-      box-shadow:0 10px 35px rgba(0,0,0,0.12);
-    ">
-
-      <!-- HEADER -->
-      <div style="background:#0f172a; padding:32px 24px; text-align:center;">
-        <img src="https://cgqnrqbyvetcgwolkjvl.supabase.co/storage/v1/object/public/gregaplay-assets/logo.png"
-             alt="Grega Play"
-             style="width:180px; height:auto; display:block; margin:auto;" />
-        <p style="color:#e2e8f0; font-size:14px; margin-top:12px; opacity:0.8;">
-          Together, we create the moment
-        </p>
-      </div>
-
-      <!-- CONTENU -->
-      <div style="padding:32px;">
-        <h2 style="font-size:22px; margin:0; color:#0f172a; text-align:center;">
-          ⏰ Dernier rappel !
-        </h2>
-
-        <p style="margin-top:18px; font-size:15px; color:#334155; text-align:center; line-height:1.6;">
-          Il reste moins de <strong>24 heures</strong> pour participer à l'évènement :
-          <br />
-          <span style="font-size:18px; color:#16a34a;"><strong>${event.title}</strong></span>
-        </p>
-
-        <p style="margin-top:12px; font-size:14px; color:#475569; line-height:1.6; text-align:center;">
-          Envoie ta vidéo maintenant pour apparaître dans le montage final
-        </p>
-
-        <!-- BOUTON CTA -->
-        <div style="text-align:center; margin:28px 0 24px;">
-          <a href="https://gregaplay.com/invitation/${inv.token}"
-             style="
-               background:linear-gradient(135deg, #16a34a, #059669);
-               padding:16px 36px;
-               display:inline-block;
-               font-size:16px;
-               font-weight:bold;
-               color:#ffffff;
-               border-radius:12px;
-               text-decoration:none;
-               box-shadow:0 6px 18px rgba(0,0,0,0.20);
-             "
-             target="_blank"
-          >
-            👉 Participer à l’évènement
-          </a>
-        </div>
-
-        <p style="font-size:12px; text-align:center; color:#64748b;">
-          Si le bouton ne fonctionne pas, ouvre ce lien :
-          <br />
-          <a href="https://gregaplay.com/invitation/${inv.token}" 
-             style="color:#16a34a;"
-          >
-            https://gregaplay.com/invitation/${inv.token}
-          </a>
-        </p>
-      </div>
-
-      <!-- FOOTER -->
-      <div style="background:#f8fafc; padding:16px; text-align:center; font-size:12px; color:#94a3b8;">
-        Grega Play – L’émotion se construit ensemble<br/>
-        <span style="font-size:11px; color:#94a3b8;">Rappel automatique</span>
-      </div>
-
-    </div>
-  </div>
-`,
+    if (participantsError) {
+      console.error("❌ Erreur récupération participants:", participantsError);
+      return res.status(500).json({
+        error: "Erreur lors de la récupération des participants.",
       });
     }
 
-    return res.json({
-      message: "Relance envoyée",
-      remindersSent: pendingInvitations.length,
+    const participantsToRemind = (participants || []).filter(
+      (p) => !p.has_submitted && p.email
+    );
+
+    if (participantsToRemind.length === 0) {
+      return res.status(200).json({
+        message: "Aucun participant à relancer (tous ont soumis une vidéo).",
+      });
+    }
+
+    await emailService.sendReminderToParticipants({
+      event,
+      participants: participantsToRemind,
+    });
+
+    return res.status(200).json({
+      message: "Emails de relance envoyés aux participants en attente.",
+      count: participantsToRemind.length,
     });
   } catch (err) {
-    console.error("❌ Erreur remind:", err);
-    return res.status(500).json({ error: "Erreur serveur lors de la relance" });
+    console.error("❌ Erreur /api/events/:eventId/remind:", err);
+    return res.status(500).json({
+      error: "Erreur interne lors de l'envoi des relances.",
+    });
   }
 });
 
-// ======================================================
-// 🗑️ Suppression d’un événement + cascade
-//     + contrôle créateur
-//     + suppression éventuelle de la vidéo finale
-// ======================================================
+// ------------------------------------------------------
+// 🔔 Stats d'installation PWA
+// ------------------------------------------------------
+app.post("/api/track-install", async (req, res) => {
+  try {
+    const userAgent = req.headers["user-agent"] || null;
+    const ip =
+      req.headers["x-forwarded-for"] ||
+      req.connection?.remoteAddress ||
+      req.socket?.remoteAddress ||
+      "unknown";
+
+    const { error } = await supabase.from("app_install_events").insert([
+      { ip, user_agent: userAgent },
+    ]);
+
+    if (error) {
+      console.error("❌ Erreur enregistrement app_install_events:", error);
+    }
+
+    res.json({ message: "Install click tracked" });
+  } catch (err) {
+    console.error("❌ Erreur /api/track-install:", err);
+    res.status(500).json({ error: "Erreur interne tracking install." });
+  }
+});
+
+// ------------------------------------------------------
+// 🗑️ Suppression complète d'un événement (et fichiers associés)
+// ------------------------------------------------------
 app.delete("/api/events/:eventId", async (req, res) => {
   const { eventId } = req.params;
-  const { userId } = req.body || {}; // 🔄 on récupère le userId envoyé par le front
+  const { userId } = req.body;
 
   if (!userId) {
-    return res
-      .status(400)
-      .json({ error: "userId requis pour supprimer l'événement" });
+    return res.status(400).json({
+      error:
+        "userId est requis pour vérifier que seul le créateur peut supprimer.",
+    });
   }
 
   try {
-    // 1) Vérifier que l'événement existe + récupérer le créateur + URL finale
-    const { data: event, error: eventErr } = await supabase
+    const { data: event, error: eventError } = await supabase
       .from("events")
-      .select("id, user_id, final_video_url")
+      .select("id, user_id, final_video_path")
       .eq("id", eventId)
       .single();
 
-    if (eventErr || !event) {
-      return res.status(404).json({ error: "Événement introuvable" });
+    if (eventError || !event) {
+      console.error("❌ Événement introuvable pour la suppression:", eventError);
+      return res
+        .status(404)
+        .json({ error: "Événement introuvable ou déjà supprimé." });
     }
 
-    // 2) Vérifier que le userId correspondant est bien le créateur
     if (event.user_id !== userId) {
       return res.status(403).json({
-        error: "FORBIDDEN",
-        message: "Seul le créateur de l'événement peut le supprimer.",
+        error: "Seul le créateur de l'événement peut le supprimer.",
       });
     }
 
-    // 3) Récupérer les vidéos pour supprimer les fichiers du Storage
-    const { data: videos, error: videosErr } = await supabase
+    const { data: videos, error: videosError } = await supabase
       .from("videos")
-      .select("id, storage_path")
+      .select("video_url")
       .eq("event_id", eventId);
 
-    if (videosErr) throw videosErr;
+    if (videosError) {
+      console.error("❌ Erreur récupération vidéos pour suppression:", videosError);
+      return res.status(500).json({
+        error: "Erreur interne lors de la récupération des vidéos.",
+      });
+    }
 
-    if (videos && videos.length > 0) {
-      const paths = videos
-        .map((v) => v.storage_path)
-        .filter((p) => typeof p === "string" && p.length > 0);
+    const filesToRemove = [];
 
-      if (paths.length > 0) {
-        const { error: storageErr } = await supabase.storage
-          .from("videos")
-          .remove(paths);
-        if (storageErr) throw storageErr;
+    for (const vid of videos || []) {
+      const parsed = getBucketAndPathFromPublicUrl(vid.video_url);
+      if (parsed) filesToRemove.push({ bucket: parsed.bucket, path: parsed.path });
+    }
+
+    if (event.final_video_path) {
+      filesToRemove.push({
+        bucket: "final-videos",
+        path: event.final_video_path,
+      });
+    }
+
+    const bucketGroups = {};
+    for (const file of filesToRemove) {
+      if (!bucketGroups[file.bucket]) bucketGroups[file.bucket] = [];
+      bucketGroups[file.bucket].push(file.path);
+    }
+
+    for (const [bucket, paths] of Object.entries(bucketGroups)) {
+      const { error: removeError } = await supabase.storage.from(bucket).remove(paths);
+
+      if (removeError) {
+        console.error(`❌ Erreur suppression fichiers dans le bucket ${bucket}:`, removeError);
+      } else {
+        console.log(`🗑️ Fichiers supprimés dans le bucket ${bucket}:`, paths.length);
       }
     }
 
-    // 4) Supprimer les vidéos (en base)
-    await supabase.from("videos").delete().eq("event_id", eventId);
+    const { error: participantsError } = await supabase
+      .from("event_participants")
+      .delete()
+      .eq("event_id", eventId);
 
-    // 5) Supprimer les invitations
-    await supabase.from("invitations").delete().eq("event_id", eventId);
-
-    // 6) Supprimer les participants
-    await supabase.from("event_participants").delete().eq("event_id", eventId);
-
-    // 7) Supprimer les logs d'upload liés à cet événement
-    await supabase.from("upload_logs").delete().eq("event_id", eventId);
-
-    // 8) Supprimer la vidéo finale dans son bucket si possible
-    if (event.final_video_url) {
-      const info = extractStorageInfoFromPublicUrl(event.final_video_url);
-      if (info) {
-        const { bucket, path } = info;
-        try {
-          const { error: finalStorageErr } = await supabase.storage
-            .from(bucket)
-            .remove([path]);
-          if (finalStorageErr) {
-            console.error(
-              "⚠️ Erreur suppression fichier vidéo finale:",
-              finalStorageErr
-            );
-          }
-        } catch (e) {
-          console.error("⚠️ Exception suppression vidéo finale:", e);
-        }
-      }
+    if (participantsError) {
+      console.error("⚠️ Erreur suppression participants event:", participantsError);
     }
 
-    // 9) Supprimer l'événement lui-même
-    const { error: delEventErr } = await supabase
+    const { error: videosDeleteError } = await supabase
+      .from("videos")
+      .delete()
+      .eq("event_id", eventId);
+
+    if (videosDeleteError) {
+      console.error("⚠️ Erreur suppression vidéos event:", videosDeleteError);
+    }
+
+    const { error: eventDeleteError } = await supabase
       .from("events")
       .delete()
       .eq("id", eventId);
 
-    if (delEventErr) throw delEventErr;
+    if (eventDeleteError) {
+      console.error("❌ Erreur suppression event:", eventDeleteError);
+      return res
+        .status(500)
+        .json({ error: "Erreur lors de la suppression de l'événement." });
+    }
 
-    return res.json({ success: true });
+    return res.status(200).json({
+      message: "Événement et données associées supprimés.",
+    });
   } catch (err) {
-    console.error("❌ Erreur suppression événement:", err);
+    console.error("❌ Erreur /api/events/:eventId (delete):", err);
     return res.status(500).json({
-      error: "Erreur lors de la suppression de l'événement",
+      error: "Erreur interne lors de la suppression de l'événement.",
     });
   }
 });
 
-// ======================================================
-// 🚀 Lancement serveur
-// ======================================================
+// ------------------------------------------------------
+// 🚀 Démarrage du serveur
+// ------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Backend Grega Play en écoute sur le port ${PORT}`);
 });
+
+export default app;
