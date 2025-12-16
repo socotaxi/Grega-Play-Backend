@@ -461,66 +461,72 @@ function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath) {
 // laisse-la telle quelle. (Ici on ne la réécrit pas car elle n'était pas dans l'extrait fourni.)
 
 function addIntroOutroFullMusic(corePath, outputPath, introPath, outroPath, totalDuration, musicPath, volume, ducking) {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
-      console.warn("⚠️ intro/outro introuvable, export sans habillage.");
-      fs.copyFileSync(corePath, outputPath);
-      return resolve();
-    }
-
-    const safeTotal = Math.max(0, Number(totalDuration) || 0);
-    const introDur = 3;
-    const outroDur = 2;
-    const coreDur = Math.max(safeTotal - introDur - outroDur, 0);
-    const totalWithIO = introDur + coreDur + outroDur;
-
-    // Ducking optionnel (musique baissée quand la voix est présente)
-    const duckFilter = ducking ? `[music][voice]${duckMusicAgainstVoice()}[musicduck]` : ``;
-    const musicLabel = ducking ? "musicduck" : "music";
-
-    const filterParts = [
-      // Pads pour éviter l'erreur concat (différences de tailles)
-      `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0]`,
-      `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1]`,
-      `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2]`,
-      `[v0][v1][v2]concat=n=3:v=1:a=0[v]`,
-
-      // Voix = audio du core décalé pour commencer après l'intro
-      `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice]`,
-
-      // Musique = loop + trim à la durée totale du montage
-      `[3:a]volume=${Number(volume) || 0.6},atrim=0:${totalWithIO},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[music]`,
-    ];
-
-    if (ducking) filterParts.push(duckFilter);
-
-    // Mix final
-    filterParts.push(`[voice][${musicLabel}]amix=inputs=2:duration=longest[a]`);
-
-    const filter = filterParts.join("; ");
-
-    const cmd =
-      `ffmpeg -y ` +
-      `-loop 1 -t ${introDur} -i "${introPath}" ` +
-      `-i "${corePath}" ` +
-      `-loop 1 -t ${outroDur} -i "${outroPath}" ` +
-      `-stream_loop -1 -i "${musicPath}" ` +
-      `-filter_complex "${filter}" ` +
-      `-map "[v]" -map "[a]" ` +
-      `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
-
-    console.log("➡️ FFmpeg intro/outro (full music + ducking):", cmd);
-
-    exec(cmd, (error, stdout, stderr) => {
-      if (error) {
-        console.error("❌ FFmpeg intro/outro (full) error:", stderr || stdout);
-        return reject(new Error(`Erreur FFmpeg (musique full): ${String(stderr || stdout).slice(-2000)}`));
+  return new Promise(async (resolve, reject) => {
+    try {
+      if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
+        console.warn("⚠️ intro/outro introuvable, export sans habillage.");
+        fs.copyFileSync(corePath, outputPath);
+        return resolve();
       }
+
+      const safeTotal = Math.max(0, Number(totalDuration) || 0);
+      const introDur = 3;
+      const outroDur = 2;
+
+      // Durée finale forcée (le point clé)
+      const totalWithIO = safeTotal > 0 ? safeTotal : (introDur + outroDur + 10);
+
+      const duckFilter = ducking ? `[music][voice]${duckMusicAgainstVoice()}[musicduck]` : "";
+      const musicLabel = ducking ? "musicduck" : "music";
+
+      const filterParts = [
+        `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0]`,
+        `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1]`,
+        `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2]`,
+        `[v0][v1][v2]concat=n=3:v=1:a=0[v]`,
+
+        // Voice (audio du core) retardé pour démarrer après l’intro
+        `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice]`,
+
+        // Musique forcée à une durée finie (double sécurité)
+        `[3:a]volume=${Number(volume) || 0.6},atrim=0:${totalWithIO},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[music]`,
+      ];
+
+      if (ducking) filterParts.push(duckFilter);
+
+      // IMPORTANT: duration=shortest pour éviter un rendu infini
+      filterParts.push(`[voice][${musicLabel}]amix=inputs=2:duration=shortest:dropout_transition=0[a]`);
+
+      const filter = filterParts.join("; ");
+
+      const cmd =
+        `ffmpeg -y -hide_banner -loglevel warning ` +
+        `-loop 1 -t ${introDur} -i "${introPath}" ` +
+        `-i "${corePath}" ` +
+        `-loop 1 -t ${outroDur} -i "${outroPath}" ` +
+        `-stream_loop -1 -i "${musicPath}" ` +
+        `-filter_complex "${filter}" ` +
+        `-map "[v]" -map "[a]" ` +
+        `-t ${totalWithIO} -shortest ` +
+        `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
+        `-c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
+
+      console.log("➡️ FFmpeg intro/outro (full music + ducking):", cmd);
+
+      // execAsync pour éviter des blocages maxBuffer
+      const { stderr } = await execAsync(cmd, { maxBuffer: 50 * 1024 * 1024 });
+
+      if (stderr) console.log("ℹ️ FFmpeg intro/outro stderr (tail):", String(stderr).slice(-2000));
+
       console.log("✅ Intro/outro + musique full:", outputPath);
-      resolve();
-    });
+      return resolve();
+    } catch (e) {
+      console.error("❌ FFmpeg intro/outro (full) error:", e);
+      return reject(new Error(`Erreur FFmpeg (musique full): ${String(e?.message || e).slice(-2000)}`));
+    }
   });
 }
+
 
 // ✅ Watermark
 function applyWatermark(inputPath, outputPath) {
