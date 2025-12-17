@@ -8,13 +8,7 @@ import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import fetch from "cross-fetch";
 import { promisify } from "util";
-import {
-  TRANSITION_MAP,
-  safePreset,
-  resolveTransitionName,
-  resolveTransitionDuration,
-  normalizeEffectivePreset,
-} from "./videoProcessing/videoPreset.schema.js";
+import { TRANSITION_MAP, safePreset, resolveTransitionName, resolveTransitionDuration, normalizeEffectivePreset } from "./videoProcessing/videoPreset.schema.js";
 
 global.fetch = fetch;
 
@@ -25,30 +19,31 @@ const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
 
+// Hard safety: prevent FFmpeg from hanging forever in production
+const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 20 * 60 * 1000); // default 20 minutes
+const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024); // 50MB
+
+async function runCmd(cmd, { label = "cmd" } = {}) {
+  try {
+    const { stdout, stderr } = await runCmd(cmd, {
+      timeout: FFMPEG_TIMEOUT_MS,
+      maxBuffer: EXEC_MAX_BUFFER,
+    });
+    return { stdout, stderr };
+  } catch (e) {
+    // Normalize node's timeout error message
+    if (e && (e.killed || String(e.message || "").includes("timed out"))) {
+      e.message = `Timeout (${Math.round(FFMPEG_TIMEOUT_MS / 1000)}s) sur ${label}`;
+    }
+    throw e;
+  }
+}
+
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY manquant.");
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-
-// ------------------------------------------------------
-// ✅ Helpers robustes (PROD)
-// ------------------------------------------------------
-function toSafeNumber(value, fallback) {
-  if (value === null || value === undefined) return fallback;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-
-  const normalized = String(value).trim().replace(",", ".");
-  const n = Number(normalized);
-
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function clamp(n, min, max) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return min;
-  return Math.min(Math.max(x, min), max);
-}
 
 // 🔐 Helper pour éviter l'erreur EBUSY sur Windows lors du rename
 const renameAsync = promisify(fs.rename);
@@ -147,7 +142,7 @@ function downloadFile(url, outputPath) {
 async function hasAudioStream(inputPath) {
   try {
     const cmd = `ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "${inputPath}"`;
-    const { stdout } = await execAsync(cmd);
+    const { stdout } = await runCmd(cmd);
     return String(stdout || "").trim() === "audio";
   } catch {
     return false;
@@ -157,7 +152,7 @@ async function hasAudioStream(inputPath) {
 async function probeStreamsSummary(inputPath) {
   try {
     const cmd = `ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,sample_rate,channels:stream_tags=rotate -of json "${inputPath}"`;
-    const { stdout } = await execAsync(cmd);
+    const { stdout } = await runCmd(cmd);
     const json = JSON.parse(stdout || "{}");
     const streams = Array.isArray(json.streams) ? json.streams : [];
     return streams.map((s) => ({
@@ -230,7 +225,7 @@ async function normalizeVideo(inputPath, outputPath, fps = 30) {
 
   console.log("➡️ FFmpeg normalize (robuste):", cmd);
 
-  const { stderr } = await execAsync(cmd, { maxBuffer: 20 * 1024 * 1024 });
+  const { stderr } = await runCmd(cmd, { label: "ffprobe" });
   if (stderr) console.log("ℹ️ FFmpeg normalize stderr (tail):", String(stderr).slice(-2000));
   console.log("✅ Vidéo normalisée:", outputPath);
 }
@@ -240,23 +235,19 @@ async function normalizeVideo(inputPath, outputPath, fps = 30) {
 // ------------------------------------------------------
 function runFFmpegFilterConcat(processedPaths, durations, outputPath, transition = "fadeblack", transitionDuration = 0.3) {
   return new Promise((resolve, reject) => {
-    // ✅ PROD GUARD: duration peut arriver comme "0,3" => le normaliser ici aussi
-    let td = toSafeNumber(transitionDuration, 0.6);
-    td = clamp(td, 0.1, 2.0);
-
     const inputs = processedPaths.map((p) => `-i "${p}"`).join(" ");
 
     let offset = 0;
     const offsets = [];
     for (let i = 0; i < durations.length - 1; i++) {
       const d = Number(durations[i]) || 0;
-      const step = Math.max(d - td, 0);
+      const step = Math.max(d - transitionDuration, 0);
       offset += step;
       offsets.push(Number(offset.toFixed(3)));
     }
 
     console.log("🧩 CONCAT DEBUG durations:", durations.map((d) => Number(d?.toFixed?.(3) ?? d)));
-    console.log("🧩 CONCAT DEBUG transition:", transition, "dur:", td, "offsets:", offsets);
+    console.log("🧩 CONCAT DEBUG transition:", transition, "dur:", transitionDuration, "offsets:", offsets);
 
     let filter = "";
 
@@ -282,16 +273,12 @@ function runFFmpegFilterConcat(processedPaths, durations, outputPath, transition
       const aOut = `a${i}o`;
       const off = offsets[i - 1] ?? 0;
 
-      filter += `[${vLast}][v${i}]xfade=transition=${transition}:duration=${td}:offset=${off}[${vOut}];`;
-      filter += `[${aLast}][a${i}]acrossfade=d=${td}:c1=tri:c2=tri[${aOut}];`;
+      filter += `[${vLast}][v${i}]xfade=transition=${transition}:duration=${transitionDuration}:offset=${off}[${vOut}];`;
+      filter += `[${aLast}][a${i}]acrossfade=d=${transitionDuration}:c1=tri:c2=tri[${aOut}];`;
 
       vLast = vOut;
       aLast = aOut;
     }
-
-    // ✅ FIX PRODUCTION: éviter un ";" final => "No such filter: ''"
-    filter = String(filter || "").trim();
-    while (filter.endsWith(";")) filter = filter.slice(0, -1).trim();
 
     const cmd =
       `ffmpeg -y ${inputs} ` +
@@ -331,7 +318,7 @@ async function generateTextSlide(outputPngPath, text, durationSeconds) {
 
   const cmd = `ffmpeg -y -f lavfi -i "color=c=black:s=720x1280:d=${Number(durationSeconds) || 3}" -vframes 1 -vf "drawtext=text='${safeText}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=12" "${outputPngPath}"`;
   console.log("➡️ FFmpeg text slide:", cmd);
-  await execAsync(cmd);
+  await runCmd(cmd);
 }
 
 async function resolveVisualAsset({ kind, preset, defaultPath, tempDir }) {
@@ -439,8 +426,7 @@ function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath) {
       `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[a]`,
     ].join("; ");
 
-    const cmdNoMusic =
-      `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" -i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
+    const cmdNoMusic = `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" -i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
       `-filter_complex "${filter}" -map "[v]" -map "[a]" ` +
       `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
 
@@ -457,73 +443,65 @@ function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath) {
   });
 }
 
-// NOTE: cette fonction est référencée plus haut (mode intro_outro). Si elle existe ailleurs dans ton fichier original,
-// laisse-la telle quelle. (Ici on ne la réécrit pas car elle n'était pas dans l'extrait fourni.)
 
 function addIntroOutroFullMusic(corePath, outputPath, introPath, outroPath, totalDuration, musicPath, volume, ducking) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
-        console.warn("⚠️ intro/outro introuvable, export sans habillage.");
-        fs.copyFileSync(corePath, outputPath);
-        return resolve();
-      }
-
-      const safeTotal = Math.max(0, Number(totalDuration) || 0);
-      const introDur = 3;
-      const outroDur = 2;
-
-      // Durée finale forcée (le point clé)
-      const totalWithIO = safeTotal > 0 ? safeTotal : (introDur + outroDur + 10);
-
-      const duckFilter = ducking ? `[music][voice]${duckMusicAgainstVoice()}[musicduck]` : "";
-      const musicLabel = ducking ? "musicduck" : "music";
-
-      const filterParts = [
-        `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0]`,
-        `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1]`,
-        `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2]`,
-        `[v0][v1][v2]concat=n=3:v=1:a=0[v]`,
-
-        // Voice (audio du core) retardé pour démarrer après l’intro
-        `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice]`,
-
-        // Musique forcée à une durée finie (double sécurité)
-        `[3:a]volume=${Number(volume) || 0.6},atrim=0:${totalWithIO},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[music]`,
-      ];
-
-      if (ducking) filterParts.push(duckFilter);
-
-      // IMPORTANT: duration=shortest pour éviter un rendu infini
-      filterParts.push(`[voice][${musicLabel}]amix=inputs=2:duration=shortest:dropout_transition=0[a]`);
-
-      const filter = filterParts.join("; ");
-
-      const cmd =
-        `ffmpeg -y -hide_banner -loglevel warning ` +
-        `-loop 1 -t ${introDur} -i "${introPath}" ` +
-        `-i "${corePath}" ` +
-        `-loop 1 -t ${outroDur} -i "${outroPath}" ` +
-        `-stream_loop -1 -i "${musicPath}" ` +
-        `-filter_complex "${filter}" ` +
-        `-map "[v]" -map "[a]" ` +
-        `-t ${totalWithIO} -shortest ` +
-        `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
-        `-c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
-
-      console.log("➡️ FFmpeg intro/outro (full music + ducking):", cmd);
-
-      // execAsync pour éviter des blocages maxBuffer
-      const { stderr } = await execAsync(cmd, { maxBuffer: 50 * 1024 * 1024 });
-
-      if (stderr) console.log("ℹ️ FFmpeg intro/outro stderr (tail):", String(stderr).slice(-2000));
-
-      console.log("✅ Intro/outro + musique full:", outputPath);
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
+      console.warn("⚠️ intro/outro introuvable, export sans habillage.");
+      fs.copyFileSync(corePath, outputPath);
       return resolve();
-    } catch (e) {
-      console.error("❌ FFmpeg intro/outro (full) error:", e);
-      return reject(new Error(`Erreur FFmpeg (musique full): ${String(e?.message || e).slice(-2000)}`));
     }
+
+    const safeTotal = Math.max(0, Number(totalDuration) || 0);
+    const introDur = 3;
+    const outroDur = 2;
+    const coreDur = Math.max(safeTotal - introDur - outroDur, 0);
+    const totalWithIO = introDur + coreDur + outroDur;
+
+    // Ducking optionnel (musique baissée quand la voix est présente)
+    const duckFilter = ducking ? `[music][voice]${duckMusicAgainstVoice()}[musicduck]` : ``;
+    const musicLabel = ducking ? "musicduck" : "music";
+
+    const filterParts = [
+      // Pads pour éviter l'erreur concat (différences de tailles)
+      `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0]`,
+      `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1]`,
+      `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2]`,
+      `[v0][v1][v2]concat=n=3:v=1:a=0[v]`,
+
+      // Voix = audio du core décalé pour commencer après l'intro
+      `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice]`,
+
+      // Musique = loop + trim à la durée totale du montage
+      `[3:a]volume=${Number(volume) || 0.6},atrim=0:${totalWithIO},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[music]`,
+    ];
+
+    if (ducking) filterParts.push(duckFilter);
+
+    // Mix final
+    filterParts.push(`[voice][${musicLabel}]amix=inputs=2:duration=longest[a]`);
+
+    const filter = filterParts.join("; ");
+
+    const cmd = `ffmpeg -y ` +
+      `-loop 1 -t ${introDur} -i "${introPath}" ` +
+      `-i "${corePath}" ` +
+      `-loop 1 -t ${outroDur} -i "${outroPath}" ` +
+      `-stream_loop -1 -i "${musicPath}" ` +
+      `-filter_complex "${filter}" ` +
+      `-map "[v]" -map "[a]" ` +
+      `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
+
+    console.log("➡️ FFmpeg intro/outro (full music + ducking):", cmd);
+
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ FFmpeg intro/outro (full) error:", stderr || stdout);
+        return reject(new Error(`Erreur FFmpeg (musique full): ${String(stderr || stdout).slice(-2000)}`));
+      }
+      console.log("✅ Intro/outro + musique full:", outputPath);
+      resolve();
+    });
   });
 }
 
@@ -553,64 +531,7 @@ function applyWatermark(inputPath, outputPath) {
   });
 }
 
-export default async function processVideo(eventId, selectedVideoIds, effectivePreset = null, opts = {}) {
-
-  // ✅ Job watchdog (deadline + abort)
-  const jobId = opts?.jobId || null;
-  const deadlineMs = Number.isFinite(opts?.deadlineMs) ? Number(opts.deadlineMs) : (Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000);
-  const startedAtMs =
-    Number.isFinite(opts?.startedAtMs) ? Number(opts.startedAtMs) : Date.now();
-
-  async function _failJobIfNeeded(payload) {
-    if (!jobId) return;
-    try {
-      await supabase
-        .from("video_jobs")
-        .update({
-          ...payload,
-          finished_at: new Date().toISOString(),
-        })
-        .eq("id", jobId);
-    } catch (e) {
-      console.error("❌ JOB watchdog: impossible de mettre à jour video_jobs:", e?.message || e);
-    }
-  }
-
-  async function ensureJobAlive(stage) {
-    // Deadline
-    const now = Date.now();
-    if (deadlineMs > 0 && now - startedAtMs > deadlineMs) {
-      await _failJobIfNeeded({
-        status: "failed",
-        progress: 0,
-        error: `TIMEOUT: job processing > ${Math.round(deadlineMs / 1000)}s (stage=${stage})`,
-      });
-      const err = new Error("JOB_TIMEOUT");
-      err.code = "JOB_TIMEOUT";
-      throw err;
-    }
-
-    // Abort by admin (or external)
-    if (!jobId) return;
-    try {
-      const { data, error } = await supabase
-        .from("video_jobs")
-        .select("status,error")
-        .eq("id", jobId)
-        .maybeSingle();
-
-      if (error) return; // do not block processing for transient read errors
-      if (data && data.status && data.status !== "processing") {
-        const err = new Error("JOB_ABORTED");
-        err.code = "JOB_ABORTED";
-        err.details = { stage, status: data.status, error: data.error };
-        throw err;
-      }
-    } catch (e) {
-      if (e?.code === "JOB_ABORTED") throw e;
-      // ignore other errors
-    }
-  }
+export default async function processVideo(eventId, selectedVideoIds, effectivePreset = null) {
   // 🔒 Ensure preset shape is consistent everywhere (controller & processVideo)
   effectivePreset = normalizeEffectivePreset(effectivePreset);
 
@@ -673,7 +594,6 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
   // 1) vidéos
   console.log("➡️ Étape 1 : Récupération des vidéos sélectionnées depuis Supabase...");
-  await ensureJobAlive("download");
   const { data: videos, error } = await supabase
     .from("videos")
     .select("id, storage_path")
@@ -698,7 +618,6 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
   // 3) download + normalize
   console.log("➡️ Étape 3 : Téléchargement + Normalisation (portrait)...");
-  await ensureJobAlive("concat");
   const processedPaths = [];
   const CONCURRENCY = 2;
 
@@ -740,15 +659,13 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
   // 4) concat with preset transition
   const presetForConcat = safePreset(effectivePresetResolved);
-  const transitionName = resolveTransitionName(presetForConcat);
-
-  // ✅ PROD FIX: transitionDuration peut être "0,3" (locale FR) => normaliser ici
-  const rawTransitionDuration = resolveTransitionDuration(presetForConcat);
-  const transitionDuration = clamp(toSafeNumber(rawTransitionDuration, 0.6), 0.1, 2.0);
-
-  console.log("🎚️ SAFE transitionDuration =", transitionDuration, "(raw:", rawTransitionDuration, ")");
-
-  await runFFmpegFilterConcat(processedPaths, durations, outputPath, transitionName, transitionDuration);
+  await runFFmpegFilterConcat(
+    processedPaths,
+    durations,
+    outputPath,
+    resolveTransitionName(presetForConcat),
+    resolveTransitionDuration(presetForConcat)
+  );
 
   // 4.1) intro/outro + music
   const corePath = path.join(tempDir, "final_core.mp4");
