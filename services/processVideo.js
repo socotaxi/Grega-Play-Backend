@@ -31,6 +31,7 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
     });
     return { stdout, stderr };
   } catch (e) {
+    // Normalize node's timeout error message
     if (e && (e.killed || String(e.message || "").includes("timed out"))) {
       e.message = `Timeout (${Math.round(FFMPEG_TIMEOUT_MS / 1000)}s) sur ${label}`;
     }
@@ -38,47 +39,12 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
   }
 }
 
-
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY manquant.");
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-
-// ------------------------------------------------------
-// ✅ Job control helpers (progress + cancel)
-// ------------------------------------------------------
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function fileExists(p) {
-  try {
-    await fs.promises.access(p, fs.constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function assertNotCancelled(cancelFilePath) {
-  if (!cancelFilePath) return;
-  if (await fileExists(cancelFilePath)) {
-    const err = new Error("Job annulé (kill).");
-    err.code = "JOB_KILLED";
-    throw err;
-  }
-}
-
-async function emitProgress(onProgress, progress, meta = {}) {
-  if (typeof onProgress !== "function") return;
-  try {
-    await onProgress(progress, meta);
-  } catch (e) {
-    console.warn("⚠️ onProgress failed (ignored):", e?.message || e);
-  }
-}
 // 🔐 Helper pour éviter l'erreur EBUSY sur Windows lors du rename
 const renameAsync = promisify(fs.rename);
 
@@ -314,9 +280,6 @@ function runFFmpegFilterConcat(processedPaths, durations, outputPath, transition
       aLast = aOut;
     }
 
-    filter = String(filter || "").trim();
-    if (filter.endsWith(";")) filter = filter.slice(0, -1);
-
     const cmd =
       `ffmpeg -y ${inputs} ` +
       `-filter_complex "${filter}" ` +
@@ -442,46 +405,41 @@ function addIntroOutroWithOptions(corePath, outputPath, introPath, outroPath, to
   });
 }
 
-function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, { cancelFilePath } = {}) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      await assertNotCancelled(cancelFilePath);
+function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath) {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
+      console.warn("⚠️ intro/outro introuvable, export sans habillage.");
+      fs.copyFileSync(corePath, outputPath);
+      return resolve();
+    }
 
-      if (!fs.existsSync(introPath) || !fs.existsSync(outroPath)) {
-        console.warn("⚠️ intro/outro introuvable, export sans habillage.");
-        fs.copyFileSync(corePath, outputPath);
-        return resolve();
+    const introDur = 3;
+    const outroDur = 2;
+
+    // Important: pad() pour forcer toutes les images/vidéos à 720x1280 avant concat
+    const filter = [
+      `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0]`,
+      `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1]`,
+      `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2]`,
+      `[v0][v1][v2]concat=n=3:v=1:a=0[v]`,
+      // on décale l'audio du core pour commencer après l'intro
+      `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[a]`,
+    ].join("; ");
+
+    const cmdNoMusic = `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" -i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
+      `-filter_complex "${filter}" -map "[v]" -map "[a]" ` +
+      `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
+
+    console.log("➡️ FFmpeg intro/outro (no music):", cmdNoMusic);
+
+    exec(cmdNoMusic, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ FFmpeg intro/outro (no music) error:", stderr || stdout);
+        return reject(new Error(`Erreur FFmpeg (intro/outro sans musique): ${String(stderr || stdout).slice(-2000)}`));
       }
-
-      const introDur = 3;
-      const outroDur = 2;
-
-      const filter = [
-        `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0]`,
-        `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1]`,
-        `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2]`,
-        `[v0][v1][v2]concat=n=3:v=1:a=0[v]`,
-        `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[a]`,
-      ].join("; ");
-
-      const cmd =
-        `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" -i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
-        `-filter_complex "${filter}" -map "[v]" -map "[a]" ` +
-        `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
-
-      console.log("➡️ FFmpeg intro/outro (no music):", cmd);
-
-      const { stderr } = await runCmd(cmd, { label: "intro_outro_no_music(ffmpeg)" });
-      if (stderr) console.log("ℹ️ FFmpeg intro/outro stderr (tail):", String(stderr).slice(-2000));
-
-      await assertNotCancelled(cancelFilePath);
-
       console.log("✅ Intro/outro ajoutés (sans musique):", outputPath);
       resolve();
-    } catch (e) {
-      console.error("❌ FFmpeg intro/outro (no music) error:", e?.message || e);
-      reject(new Error(`Erreur FFmpeg (intro/outro sans musique): ${e?.message || "unknown"}`));
-    }
+    });
   });
 }
 
@@ -549,45 +507,35 @@ function addIntroOutroFullMusic(corePath, outputPath, introPath, outroPath, tota
 
 
 // ✅ Watermark
-function applyWatermark(inputPath, outputPath, { cancelFilePath } = {}) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      await assertNotCancelled(cancelFilePath);
+function applyWatermark(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const watermarkPath = path.join(__dirname, "assets", "watermark.png");
 
-      const watermarkPath = path.join(__dirname, "assets", "watermark.png");
+    if (!fs.existsSync(watermarkPath)) {
+      console.warn("⚠️ watermark.png introuvable, on skip watermark.");
+      fs.copyFileSync(inputPath, outputPath);
+      return resolve();
+    }
 
-      if (!fs.existsSync(watermarkPath)) {
-        console.warn("⚠️ watermark.png introuvable, on skip watermark.");
-        fs.copyFileSync(inputPath, outputPath);
-        return resolve();
+    const cmd = `ffmpeg -y -i "${inputPath}" -i "${watermarkPath}" -filter_complex "overlay=W-w-20:H-h-20" -c:v libx264 -preset veryfast -crf 23 -c:a copy "${outputPath}"`;
+    console.log("➡️ FFmpeg watermark:", cmd);
+
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ FFmpeg watermark error:", stderr || stdout);
+        return reject(new Error(`Erreur FFmpeg (watermark): ${String(stderr || stdout).slice(-2000)}`));
       }
-
-      const cmd = `ffmpeg -y -i "${inputPath}" -i "${watermarkPath}" -filter_complex "overlay=W-w-20:H-h-20" -c:v libx264 -preset veryfast -crf 23 -c:a copy "${outputPath}"`;
-      console.log("➡️ FFmpeg watermark:", cmd);
-
-      const { stderr } = await runCmd(cmd, { label: "watermark(ffmpeg)" });
-      if (stderr) console.log("ℹ️ FFmpeg watermark stderr (tail):", String(stderr).slice(-2000));
-
-      await assertNotCancelled(cancelFilePath);
-
       console.log("✅ Watermark appliqué:", outputPath);
       resolve();
-    } catch (e) {
-      console.error("❌ FFmpeg watermark error:", e?.message || e);
-      reject(new Error(`Erreur FFmpeg (watermark): ${e?.message || "unknown"}`));
-    }
+    });
   });
 }
 
-export default async function processVideo(eventId, selectedVideoIds, effectivePreset = null, jobOptions = {}) {
+export default async function processVideo(eventId, selectedVideoIds, effectivePreset = null) {
   // 🔒 Ensure preset shape is consistent everywhere (controller & processVideo)
   effectivePreset = normalizeEffectivePreset(effectivePreset);
 
   console.log(`🎬 Démarrage du montage pour l'événement : ${eventId}`);
-
-  const { onProgress, cancelFilePath } = jobOptions || {};
-  await emitProgress(onProgress, 10, { stage: "started" });
-  await assertNotCancelled(cancelFilePath);
 
   // 🔄 status = processing
   {
@@ -703,10 +651,7 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
   }
 
   // 3.1 durations
-    await emitProgress(onProgress, 30, { stage: "normalized" });
-  await assertNotCancelled(cancelFilePath);
-
-console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
+  console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
   const durations = [];
   for (const p of processedPaths) durations.push(await getVideoDuration(p));
 
@@ -714,8 +659,6 @@ console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
 
   // 4) concat with preset transition
   const presetForConcat = safePreset(effectivePresetResolved);
-  await emitProgress(onProgress, 60, { stage: "concat_start" });
-  await assertNotCancelled(cancelFilePath);
   await runFFmpegFilterConcat(
     processedPaths,
     durations,
@@ -723,10 +666,6 @@ console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
     resolveTransitionName(presetForConcat),
     resolveTransitionDuration(presetForConcat)
   );
-
-  await emitProgress(onProgress, 70, { stage: "concat_done" });
-  await assertNotCancelled(cancelFilePath);
-
 
   // 4.1) intro/outro + music
   const corePath = path.join(tempDir, "final_core.mp4");
@@ -764,10 +703,7 @@ console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
     if (!fs.existsSync(outputPath) && fs.existsSync(noWmPath)) fs.copyFileSync(noWmPath, outputPath);
   }
 
-    await emitProgress(onProgress, 90, { stage: "finalized" });
-  await assertNotCancelled(cancelFilePath);
-
-// 5) upload
+  // 5) upload
   if (!fs.existsSync(outputPath)) throw new Error("Vidéo finale introuvable sur disque (final.mp4).");
 
   const stat = await fs.promises.stat(outputPath);
@@ -819,8 +755,5 @@ console.log("➡️ Étape 3.1 : Récupération des durées (ffprobe)...");
 
   console.log("✅ Montage terminé:", finalVideoUrl);
 
-    await emitProgress(onProgress, 100, { stage: "done" });
-  await assertNotCancelled(cancelFilePath);
-
-return { ok: true, finalVideoUrl };
+  return { ok: true, finalVideoUrl };
 }
