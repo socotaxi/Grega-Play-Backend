@@ -17,7 +17,7 @@ const router = Router();
 router.post("/upload", upload.single("video"), uploadVideo);
 
 // Delete vidéo
-router.delete("/:id", deleteVideo);
+router.delete("/:videoId", deleteVideo);
 
 // Génération sync (inchangé)
 router.post("/process", processVideoSync);
