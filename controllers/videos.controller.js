@@ -14,9 +14,7 @@ import { createVideoJob, updateVideoJob, getVideoJob } from "../services/db/vide
 import { resolvePreset } from "../services/videoProcessing/presetResolver.js";
 import { normalizeRequestedOptions, isPremiumPresetRequested } from "../services/videoProcessing/videoPreset.schema.js";
 
-const JOB_DEADLINE_MS =
-  Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000; // 12 minutes par défaut
-
+const JOB_DEADLINE_MS = Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000; // 12 minutes par défaut
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
 
 function isAdmin(req) {
@@ -94,7 +92,6 @@ function overlayPreset(base, requested) {
   return out;
 }
 
-
 global.fetch = fetch;
 
 const __filename = fileURLToPath(import.meta.url);
@@ -105,21 +102,12 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY manquant (env).");
 }
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // ------------------------------------------------------
 // ✅ Constantes upload (identiques à server.js)
 // ------------------------------------------------------
-const ALLOWED_MIME_TYPES = [
-  "video/mp4",
-  "video/quicktime", // .mov
-  "video/webm",
-  "video/x-matroska", // .mkv (optionnel)
-];
-
+const ALLOWED_MIME_TYPES = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska"];
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 50);
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
@@ -175,12 +163,10 @@ async function compressVideo(inputPath, outputPath) {
 async function uploadToSupabase(bucket, filePath, storagePath, contentType) {
   const fileBuffer = await fs.promises.readFile(filePath);
 
-  const { error: uploadError } = await supabase.storage
-    .from(bucket)
-    .upload(storagePath, fileBuffer, {
-      contentType,
-      upsert: true,
-    });
+  const { error: uploadError } = await supabase.storage.from(bucket).upload(storagePath, fileBuffer, {
+    contentType,
+    upsert: true,
+  });
 
   if (uploadError) {
     console.error("❌ Erreur upload Supabase Storage:", uploadError);
@@ -253,7 +239,6 @@ function isAllowedPremiumAssetPath({ storagePath, userId, eventId }) {
   if (!p) return false;
   if (p.includes("..")) return false;
 
-  // autorise soit sous users/<userId>/..., soit sous events/<eventId>/...
   const okUser = userId ? p.startsWith(`users/${userId}/`) : false;
   const okEvent = eventId ? p.startsWith(`events/${eventId}/`) : false;
 
@@ -265,7 +250,6 @@ function sanitizePresetAssetPaths({ preset, userId, eventId }) {
 
   const out = JSON.parse(JSON.stringify(preset));
 
-  // intro/outro custom_image
   if (out?.intro?.type === "custom_image" && out?.intro?.storagePath) {
     if (!isAllowedPremiumAssetPath({ storagePath: out.intro.storagePath, userId, eventId })) {
       out.intro.storagePath = null;
@@ -280,14 +264,71 @@ function sanitizePresetAssetPaths({ preset, userId, eventId }) {
     }
   }
 
-  // musique
   if (out?.music?.mode && out.music.mode !== "none" && out?.music?.storagePath) {
     if (!isAllowedPremiumAssetPath({ storagePath: out.music.storagePath, userId, eventId })) {
-      out.music.storagePath = null; // fallback signature.mp3 côté processVideo
+      out.music.storagePath = null;
     }
   }
 
   return out;
+}
+
+// ------------------------------------------------------
+// ✅ ERREURS METIER (4xx) + reason_code pour /process-async
+// ------------------------------------------------------
+class HttpError extends Error {
+  constructor(status, reason_code, message, details = null) {
+    super(message);
+    this.status = status;
+    this.reason_code = reason_code;
+    this.details = details;
+  }
+}
+
+function respondError(res, err, fallbackMessage) {
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({
+      error: err.message,
+      reason_code: err.reason_code,
+      details: err.details ?? null,
+    });
+  }
+
+  console.error("❌ Internal error:", err);
+  return res.status(500).json({
+    error: fallbackMessage || "Erreur interne.",
+    reason_code: "INTERNAL_ERROR",
+  });
+}
+
+async function validateAsyncProcessRequest({ eventId, selectedVideoIds, userId, caps, videoIds }) {
+  if (!eventId || typeof eventId !== "string") {
+    throw new HttpError(400, "INVALID_EVENT_ID", "eventId manquant ou invalide.");
+  }
+  if (!userId || typeof userId !== "string") {
+    throw new HttpError(400, "INVALID_USER_ID", "userId manquant ou invalide.");
+  }
+
+  // videoIds (résolus plus bas) doivent être un tableau
+  if (!Array.isArray(videoIds)) {
+    throw new HttpError(400, "INVALID_VIDEO_IDS", "selectedVideoIds invalide.");
+  }
+  if (videoIds.length < 2) {
+    throw new HttpError(422, "NOT_ENOUGH_VIDEOS", "Au moins 2 vidéos sont nécessaires pour générer la vidéo finale.");
+  }
+
+  // règle max sélection (free)
+  const maxAllowed = caps?.limits?.maxClipsSelectableForFinal ?? 5;
+  if (videoIds.length > maxAllowed) {
+    throw new HttpError(
+      422,
+      "MAX_CLIPS_LIMIT",
+      `Limite atteinte : ${maxAllowed} vidéo(s) maximum pour cet événement.`,
+      { max: maxAllowed, got: videoIds.length }
+    );
+  }
+
+  return { maxAllowed };
 }
 
 // ------------------------------------------------------
@@ -318,13 +359,7 @@ export async function uploadVideo(req, res) {
   }
 
   if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-    await logRejectedUpload({
-      req,
-      reason: "MIME type non autorisé",
-      file,
-      eventId,
-      participantName,
-    });
+    await logRejectedUpload({ req, reason: "MIME type non autorisé", file, eventId, participantName });
 
     if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -357,26 +392,14 @@ export async function uploadVideo(req, res) {
       .single();
 
     if (eventError || !event) {
-      await logRejectedUpload({
-        req,
-        reason: "Événement introuvable",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "Événement introuvable", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
       return res.status(404).json({ error: "Événement introuvable." });
     }
 
     if (event.status !== "open") {
-      await logRejectedUpload({
-        req,
-        reason: "Événement non open",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "Événement non open", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -562,7 +585,11 @@ export async function uploadVideo(req, res) {
     console.error("❌ Erreur lors de /api/videos/upload:", err);
 
     if (file?.path && fs.existsSync(file.path)) {
-      try { fs.unlinkSync(file.path); } catch { /* no-op */ }
+      try {
+        fs.unlinkSync(file.path);
+      } catch {
+        /* no-op */
+      }
     }
 
     return res.status(500).json({
@@ -648,10 +675,7 @@ export async function processVideoSync(req, res) {
     if (Array.isArray(selectedVideoIds) && selectedVideoIds.length >= 2) {
       videoIds = selectedVideoIds;
     } else {
-      const { data: videos, error: videosError } = await supabase
-        .from("videos")
-        .select("id")
-        .eq("event_id", eventId);
+      const { data: videos, error: videosError } = await supabase.from("videos").select("id").eq("event_id", eventId);
 
       if (videosError) {
         console.error("❌ Erreur récupération vidéos:", videosError);
@@ -686,7 +710,6 @@ export async function processVideoSync(req, res) {
       ...resolvePreset({ caps, requestedOptions }),
     };
 
-    // 🧩 Controller proof logs (options + caps + preset)
     console.log("🎯 CONTROLLER RECEIVED OPTIONS", { eventId, userId, requestedOptions });
     console.log("🧩 CONTROLLER CAPS", caps);
 
@@ -695,7 +718,9 @@ export async function processVideoSync(req, res) {
 
     if (capsPremium || wantsPremium) {
       if (!capsPremium && wantsPremium) {
-        console.warn("⚠️ CAPS not premium but premium options requested -> applying requested options anyway (check computeEventCapabilities).");
+        console.warn(
+          "⚠️ CAPS not premium but premium options requested -> applying requested options anyway (check computeEventCapabilities)."
+        );
       }
       effectivePreset = overlayPreset(effectivePreset, requestedOptions);
     }
@@ -708,12 +733,14 @@ export async function processVideoSync(req, res) {
       music: effectivePreset?.music,
     });
 
-    // ✅ Anti-abus: sanitize storage paths for assets
     effectivePreset = sanitizePresetAssetPaths({ preset: effectivePreset, userId, eventId });
 
     console.log("📼 Lancement génération vidéo finale:", eventId, "vidéos:", videoIds.length);
 
-    const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
+    const result = await processVideo(eventId, videoIds, effectivePreset, {
+      deadlineMs: JOB_DEADLINE_MS,
+      startedAtMs: Date.now(),
+    });
     const finalVideoUrl = result?.finalVideoUrl || null;
 
     if (!finalVideoUrl) {
@@ -744,8 +771,8 @@ export async function processVideoSync(req, res) {
 export async function processVideoAsync(req, res) {
   const { eventId, selectedVideoIds, userId, options } = req.body || {};
 
-  if (!eventId) return res.status(400).json({ error: "eventId est requis." });
-  if (!userId) return res.status(400).json({ error: "userId est requis." });
+  if (!eventId) return res.status(400).json({ error: "eventId est requis.", reason_code: "MISSING_EVENT_ID" });
+  if (!userId) return res.status(400).json({ error: "userId est requis.", reason_code: "MISSING_USER_ID" });
 
   try {
     const { data: event, error: eventError } = await supabase
@@ -755,54 +782,42 @@ export async function processVideoAsync(req, res) {
       .single();
 
     if (eventError || !event) {
-      return res.status(404).json({ error: "Événement introuvable." });
+      throw new HttpError(404, "EVENT_NOT_FOUND", "Événement introuvable.");
+    }
+
+    // Event fermé (si tu utilises uniquement open/processing/done, adapte ici)
+    if (event.status && event.status !== "open") {
+      throw new HttpError(422, "EVENT_NOT_OPEN", "Cet événement n'accepte pas de montage pour le moment.", {
+        status: event.status,
+      });
     }
 
     const caps = await computeEventCapabilities({ userId, eventId });
 
     if (!caps?.role?.isCreator) {
-      return res.status(403).json({
-        error: {
-          code: "NOT_EVENT_CREATOR",
-          message: "Seul le créateur de l'événement peut lancer un montage.",
-          status: 403,
-        },
-      });
+      throw new HttpError(403, "NOT_EVENT_CREATOR", "Seul le créateur de l'événement peut lancer un montage.");
     }
 
+    // Résoudre videoIds (comme avant)
     let videoIds = [];
     if (Array.isArray(selectedVideoIds) && selectedVideoIds.length >= 2) {
       videoIds = selectedVideoIds;
     } else {
-      const { data: videos, error: videosError } = await supabase
-        .from("videos")
-        .select("id")
-        .eq("event_id", eventId);
-
+      const { data: videos, error: videosError } = await supabase.from("videos").select("id").eq("event_id", eventId);
       if (videosError) {
-        return res.status(500).json({
-          error: "Erreur lors de la récupération des vidéos de l'événement.",
-        });
+        throw new Error("Erreur lors de la récupération des vidéos de l'événement.");
       }
       videoIds = (videos || []).map((v) => v.id);
     }
 
-    if (!videoIds || videoIds.length < 2) {
-      return res.status(400).json({
-        error: "Au moins 2 vidéos sont nécessaires pour générer la vidéo finale.",
-      });
-    }
-
-    const maxAllowed = caps?.limits?.maxClipsSelectableForFinal ?? 5;
-    if (videoIds.length > maxAllowed) {
-      return res.status(403).json({
-        error: {
-          code: "MAX_CLIPS_LIMIT",
-          message: `Limite atteinte : ${maxAllowed} vidéo(s) maximum pour cet événement.`,
-          status: 403,
-        },
-      });
-    }
+    // ✅ Validation métier => 4xx reason_code
+    const { maxAllowed } = await validateAsyncProcessRequest({
+      eventId,
+      selectedVideoIds,
+      userId,
+      caps,
+      videoIds,
+    });
 
     const requestedOptions = normalizeRequestedOptions(options || {});
     let effectivePreset = {
@@ -810,8 +825,6 @@ export async function processVideoAsync(req, res) {
       ...resolvePreset({ caps, requestedOptions }),
     };
 
-    // ✅ Étape 12: anti-abus storagePath avant job/montage
-    // 🧩 Controller proof logs (options + caps + preset)
     console.log("🎯 CONTROLLER RECEIVED OPTIONS", { eventId, userId, requestedOptions });
     console.log("🧩 CONTROLLER CAPS", caps);
 
@@ -820,7 +833,9 @@ export async function processVideoAsync(req, res) {
 
     if (capsPremium || wantsPremium) {
       if (!capsPremium && wantsPremium) {
-        console.warn("⚠️ CAPS not premium but premium options requested -> applying requested options anyway (check computeEventCapabilities).");
+        console.warn(
+          "⚠️ CAPS not premium but premium options requested -> applying requested options anyway (check computeEventCapabilities)."
+        );
       }
       effectivePreset = overlayPreset(effectivePreset, requestedOptions);
     }
@@ -833,9 +848,9 @@ export async function processVideoAsync(req, res) {
       music: effectivePreset?.music,
     });
 
-    // ✅ Anti-abus: sanitize storage paths for assets
     effectivePreset = sanitizePresetAssetPaths({ preset: effectivePreset, userId, eventId });
 
+    // ✅ Crée le job
     const job = await createVideoJob({
       eventId,
       userId,
@@ -843,6 +858,7 @@ export async function processVideoAsync(req, res) {
       effectivePreset,
     });
 
+    // ✅ Lance le montage en arrière-plan
     setImmediate(async () => {
       try {
         await updateVideoJob(job.id, {
@@ -852,8 +868,11 @@ export async function processVideoAsync(req, res) {
           error: null,
         });
 
-        // ✅ IMPORTANT: passer effectivePreset au processVideo
-        const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
+        const result = await processVideo(eventId, videoIds, effectivePreset, {
+          deadlineMs: JOB_DEADLINE_MS,
+          startedAtMs: Date.now(),
+        });
+
         const finalVideoUrl = result?.finalVideoUrl || null;
 
         await updateVideoJob(job.id, {
@@ -877,16 +896,14 @@ export async function processVideoAsync(req, res) {
       }
     });
 
+    // ✅ Réponse 202 propre (et correction du bug safeJob undefined)
     return res.status(202).json({
       message: "Montage lancé.",
       jobId: job.id,
-      status: safeJob.status,
+      status: job.status,
     });
   } catch (e) {
-    console.error("❌ Erreur POST /api/videos/process-async:", e);
-    return res.status(500).json({
-      error: "Erreur interne lors du lancement du montage (async).",
-    });
+    return respondError(res, e, "Erreur interne lors du lancement du montage (async).");
   }
 }
 
@@ -900,7 +917,6 @@ export async function getJobStatus(req, res) {
   try {
     const job = await getVideoJob(jobId);
 
-    // ⏱️ Deadline serveur: si un job reste en processing trop longtemps, on le passe en failed.
     const jobAfterDeadline = await failJobTimeoutIfNeeded(job);
     const safeJob = jobAfterDeadline || job;
 
@@ -942,9 +958,7 @@ export async function getJobStatus(req, res) {
 
 export async function adminKillJob(req, res) {
   if (!isAdmin(req)) {
-    return res
-      .status(401)
-      .json({ error: "Accès non autorisé (admin key invalide)." });
+    return res.status(401).json({ error: "Accès non autorisé (admin key invalide)." });
   }
 
   const { jobId } = req.params;
@@ -970,9 +984,7 @@ export async function adminKillJob(req, res) {
 
 export async function adminRetryJob(req, res) {
   if (!isAdmin(req)) {
-    return res
-      .status(401)
-      .json({ error: "Accès non autorisé (admin key invalide)." });
+    return res.status(401).json({ error: "Accès non autorisé (admin key invalide)." });
   }
 
   const { jobId } = req.params;
@@ -982,7 +994,6 @@ export async function adminRetryJob(req, res) {
     const prev = await getVideoJob(jobId);
     if (!prev) return res.status(404).json({ error: "Job introuvable." });
 
-    // Marque l'ancien job pour audit
     try {
       if (prev.status === "processing") {
         await updateVideoJob(jobId, {
@@ -994,7 +1005,6 @@ export async function adminRetryJob(req, res) {
       }
     } catch (_) {}
 
-    // Nouveau job (plus sûr que de reset le même id)
     const newJob = await createVideoJob({
       event_id: prev.event_id,
       user_id: prev.user_id,
@@ -1005,15 +1015,11 @@ export async function adminRetryJob(req, res) {
       started_at: new Date().toISOString(),
     });
 
-    // Lance le montage en arrière-plan
     setImmediate(async () => {
       try {
         const eventId = newJob.event_id;
 
-        const { data: videos, error: videosError } = await supabase
-          .from("videos")
-          .select("id")
-          .eq("event_id", eventId);
+        const { data: videos, error: videosError } = await supabase.from("videos").select("id").eq("event_id", eventId);
 
         if (videosError) throw videosError;
 
@@ -1062,4 +1068,3 @@ export async function adminRetryJob(req, res) {
     return res.status(500).json({ error: "Erreur interne (adminRetryJob)." });
   }
 }
-

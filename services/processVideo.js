@@ -282,6 +282,10 @@ function runFFmpegFilterConcat(processedPaths, durations, outputPath, transition
       aLast = aOut;
     }
 
+    // ✅ FIX: éviter le filtre vide '' (ffmpeg "No such filter: ''") quand filter_complex finit par ';'
+    filter = String(filter || "").trim();
+    if (filter.endsWith(";")) filter = filter.slice(0, -1);
+
     const cmd =
       `ffmpeg -y ${inputs} ` +
       `-filter_complex "${filter}" ` +
@@ -428,7 +432,8 @@ function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath) {
       `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[a]`,
     ].join("; ");
 
-    const cmdNoMusic = `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" -i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
+    const cmdNoMusic =
+      `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" -i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
       `-filter_complex "${filter}" -map "[v]" -map "[a]" ` +
       `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
 
@@ -487,7 +492,8 @@ function addIntroOutroFullMusic(corePath, outputPath, introPath, outroPath, tota
 
     const filter = filterParts.join("; ");
 
-    const cmd = `ffmpeg -y ` +
+    const cmd =
+      `ffmpeg -y ` +
       `-loop 1 -t ${introDur} -i "${introPath}" ` +
       `-i "${corePath}" ` +
       `-loop 1 -t ${outroDur} -i "${outroPath}" ` +
