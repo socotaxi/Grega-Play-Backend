@@ -15,23 +15,6 @@ import { resolvePreset } from "../services/videoProcessing/presetResolver.js";
 import { normalizeRequestedOptions, isPremiumPresetRequested } from "../services/videoProcessing/videoPreset.schema.js";
 
 const JOB_DEADLINE_MS =
-
-
-function buildCancelFilePath(jobId) {
-  const tmpRoot = path.join(process.cwd(), "services", "tmp");
-  const root = fs.existsSync(tmpRoot) ? tmpRoot : path.join(process.cwd(), "tmp");
-  return path.join(root, `CANCEL_${jobId}`);
-}
-
-async function writeCancelToken(jobId) {
-  const p = buildCancelFilePath(jobId);
-  try {
-    await fs.promises.mkdir(path.dirname(p), { recursive: true });
-    await fs.promises.writeFile(p, String(Date.now()), "utf-8");
-  } catch (e) {
-    console.warn("⚠️ writeCancelToken failed:", e?.message || e);
-  }
-}
   Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000; // 12 minutes par défaut
 
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
@@ -116,6 +99,16 @@ global.fetch = fetch;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const TMP_ROOT = path.join(__dirname, "../services/tmp");
+
+function buildCancelFilePath(eventId, jobId) {
+  return path.join(TMP_ROOT, String(eventId), `CANCEL_${jobId}`);
+}
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
 const execAsync = util.promisify(exec);
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
@@ -730,17 +723,17 @@ export async function processVideoSync(req, res) {
 
     console.log("📼 Lancement génération vidéo finale:", eventId, "vidéos:", videoIds.length);
 
-    const cancelFilePath = buildCancelFilePath(job.id);
-        const onProgress = async (pct) => {
-          const safePct = Math.max(0, Math.min(100, Number(pct) || 0));
-          await updateVideoJob(job.id, { progress: safePct });
-        };
+            const cancelFilePath = buildCancelFilePath(eventId, job.id);
+        ensureDir(path.dirname(cancelFilePath));
 
         const result = await processVideo(eventId, videoIds, effectivePreset, {
           deadlineMs: JOB_DEADLINE_MS,
           startedAtMs: Date.now(),
-          onProgress,
+          jobId: job.id,
           cancelFilePath,
+          onProgress: async (p) => {
+            await updateVideoJob(job.id, { progress: p });
+          },
         });
     const finalVideoUrl = result?.finalVideoUrl || null;
 
@@ -875,13 +868,24 @@ export async function processVideoAsync(req, res) {
       try {
         await updateVideoJob(job.id, {
           status: "processing",
-          progress: 30,
+          progress: 5,
           started_at: new Date().toISOString(),
           error: null,
         });
 
         // ✅ IMPORTANT: passer effectivePreset au processVideo
-        const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
+                        const cancelFilePath = buildCancelFilePath(eventId, job.id);
+        ensureDir(path.dirname(cancelFilePath));
+
+        const result = await processVideo(eventId, videoIds, effectivePreset, {
+          deadlineMs: JOB_DEADLINE_MS,
+          startedAtMs: Date.now(),
+                    jobId: job.id,
+          cancelFilePath,
+          onProgress: async (p) => {
+                        await updateVideoJob(job.id, { progress: p });
+          },
+        });
         const finalVideoUrl = result?.finalVideoUrl || null;
 
         await updateVideoJob(job.id, {
@@ -978,11 +982,20 @@ export async function adminKillJob(req, res) {
   const { jobId } = req.params;
   if (!jobId) return res.status(400).json({ error: "jobId est requis." });
 
+  // Try to signal cancellation to the worker
+  try {
+    const job = await getVideoJob(jobId);
+    const cancelPath = buildCancelFilePath(job.event_id, jobId);
+    ensureDir(path.dirname(cancelPath));
+    fs.writeFileSync(cancelPath, String(Date.now()));
+  } catch (e) {
+    console.warn("⚠️ Unable to write cancel token:", e?.message || e);
+  }
+
+
   try {
     const job = await getVideoJob(jobId);
     if (!job) return res.status(404).json({ error: "Job introuvable." });
-
-    await writeCancelToken(jobId);
 
     await updateVideoJob(jobId, {
       status: "failed",
@@ -1029,7 +1042,7 @@ export async function adminRetryJob(req, res) {
       event_id: prev.event_id,
       user_id: prev.user_id,
       status: "processing",
-      progress: 30,
+      progress: 5,
       requested_options: prev.requested_options || {},
       effective_preset: prev.effective_preset || {},
       started_at: new Date().toISOString(),
