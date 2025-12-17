@@ -25,9 +25,11 @@ const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024);
 
 async function runCmd(cmd, { label = "cmd" } = {}) {
   try {
-    const { stdout, stderr } = await runCmd(cmd, {
+    // Use execAsync with hard timeout + buffer limits (prevents FFmpeg hangs on Railway)
+    const { stdout, stderr } = await execAsync(cmd, {
       timeout: FFMPEG_TIMEOUT_MS,
       maxBuffer: EXEC_MAX_BUFFER,
+      windowsHide: true,
     });
     return { stdout, stderr };
   } catch (e) {
@@ -142,7 +144,7 @@ function downloadFile(url, outputPath) {
 async function hasAudioStream(inputPath) {
   try {
     const cmd = `ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "${inputPath}"`;
-    const { stdout } = await runCmd(cmd);
+    const { stdout } = await runCmd(cmd, { label: "hasAudioStream(ffprobe)" });
     return String(stdout || "").trim() === "audio";
   } catch {
     return false;
@@ -152,7 +154,7 @@ async function hasAudioStream(inputPath) {
 async function probeStreamsSummary(inputPath) {
   try {
     const cmd = `ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,sample_rate,channels:stream_tags=rotate -of json "${inputPath}"`;
-    const { stdout } = await runCmd(cmd);
+    const { stdout } = await runCmd(cmd, { label: "probeStreamsSummary(ffprobe)" });
     const json = JSON.parse(stdout || "{}");
     const streams = Array.isArray(json.streams) ? json.streams : [];
     return streams.map((s) => ({
@@ -225,7 +227,7 @@ async function normalizeVideo(inputPath, outputPath, fps = 30) {
 
   console.log("➡️ FFmpeg normalize (robuste):", cmd);
 
-  const { stderr } = await runCmd(cmd, { label: "ffprobe" });
+  const { stderr } = await runCmd(cmd, { label: "normalize(ffmpeg)" });
   if (stderr) console.log("ℹ️ FFmpeg normalize stderr (tail):", String(stderr).slice(-2000));
   console.log("✅ Vidéo normalisée:", outputPath);
 }
@@ -318,7 +320,7 @@ async function generateTextSlide(outputPngPath, text, durationSeconds) {
 
   const cmd = `ffmpeg -y -f lavfi -i "color=c=black:s=720x1280:d=${Number(durationSeconds) || 3}" -vframes 1 -vf "drawtext=text='${safeText}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=12" "${outputPngPath}"`;
   console.log("➡️ FFmpeg text slide:", cmd);
-  await runCmd(cmd);
+  await runCmd(cmd, { label: "generateTextSlide(ffmpeg)" });
 }
 
 async function resolveVisualAsset({ kind, preset, defaultPath, tempDir }) {
@@ -443,6 +445,8 @@ function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath) {
   });
 }
 
+// NOTE: tes fonctions addIntroOutroIntroOutroMusic / addIntroOutroFullMusic doivent déjà exister plus bas dans ton fichier.
+// Ici je laisse le reste inchangé, comme dans ton original.
 
 function addIntroOutroFullMusic(corePath, outputPath, introPath, outroPath, totalDuration, musicPath, volume, ducking) {
   return new Promise((resolve, reject) => {
@@ -504,7 +508,6 @@ function addIntroOutroFullMusic(corePath, outputPath, introPath, outroPath, tota
     });
   });
 }
-
 
 // ✅ Watermark
 function applyWatermark(inputPath, outputPath) {
