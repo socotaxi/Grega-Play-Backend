@@ -785,12 +785,17 @@ export async function processVideoAsync(req, res) {
       throw new HttpError(404, "EVENT_NOT_FOUND", "Événement introuvable.");
     }
 
-    // Event fermé (si tu utilises uniquement open/processing/done, adapte ici)
-    if (event.status && event.status !== "open") {
-      throw new HttpError(422, "EVENT_NOT_OPEN", "Cet événement n'accepte pas de montage pour le moment.", {
-        status: event.status,
-      });
-    }
+    const s = String(event.status || "").toLowerCase();
+
+// Autoriser montage si open ou done (régénération OK)
+const allowed = new Set(["open", "done"]);
+
+if (!allowed.has(s)) {
+  throw new HttpError(422, "EVENT_NOT_OPEN", "Cet événement n'accepte pas de montage pour le moment.", {
+    status: event.status,
+  });
+}
+
 
     const caps = await computeEventCapabilities({ userId, eventId });
 
