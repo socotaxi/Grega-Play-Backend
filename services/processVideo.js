@@ -25,19 +25,19 @@ const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024);
 
 async function runCmd(cmd, { label = "cmd" } = {}) {
   try {
-    const { stdout, stderr } = await runCmd(cmd, {
+    const { stdout, stderr } = await execAsync(cmd, {
       timeout: FFMPEG_TIMEOUT_MS,
       maxBuffer: EXEC_MAX_BUFFER,
     });
     return { stdout, stderr };
   } catch (e) {
-    // Normalize node's timeout error message
     if (e && (e.killed || String(e.message || "").includes("timed out"))) {
       e.message = `Timeout (${Math.round(FFMPEG_TIMEOUT_MS / 1000)}s) sur ${label}`;
     }
     throw e;
   }
 }
+
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY manquant.");
