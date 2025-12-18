@@ -22,8 +22,6 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
 
 const OTP_EXPIRATION_MINUTES = 10;
 
-const resp = await fetch(url, { method: "POST", headers, body });
-
 
 // -----------------------------------------------------
 // HELPERS
