@@ -15,7 +15,6 @@ import emailRoutes from "../routes/emailRoutes.js";
 import whatsappAuthRoutes from "../routes/whatsappAuthRoutes.js";
 import emailService from "./emailService.js";
 
-import bodyParser from "body-parser";
 import stripePackage from "stripe";
 
 import eventsRoutes from "../routes/events.routes.js";
@@ -72,6 +71,8 @@ const supabase = createClient(
 // ------------------------------------------------------
 const app = express();
 
+app.use(express.json({ limit: "100mb" }));
+app.use(express.urlencoded({ extended: true }));
 // ------------------------------------------------------
 // ✅ CORS
 // ------------------------------------------------------
@@ -237,7 +238,7 @@ const apiKeyMiddleware = (req, res, next) => {
 // ------------------------------------------------------
 app.post(
   "/webhooks/stripe",
-  bodyParser.raw({ type: "application/json" }),
+  express.raw({ type: "application/json" }),
   async (req, res) => {
     if (!PAYMENTS_ENABLED) {
       console.warn("⚠️ Webhook Stripe reçu alors que PAYMENTS_ENABLED = false.");
