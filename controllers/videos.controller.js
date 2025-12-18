@@ -1,3 +1,4 @@
+// controllers/videos.controller.js (ESM)
 import fs from "fs";
 import path from "path";
 import util from "util";
@@ -11,11 +12,11 @@ import { createClient } from "@supabase/supabase-js";
 import processVideo, { getVideoJobStatus } from "../services/processVideo.js";
 import { computeEventCapabilities } from "../services/capabilitiesService.js";
 import { createVideoJob, updateVideoJob, getVideoJob } from "../services/db/videoJobs.repo.js";
-import { resolvePreset } from "../services/videoProcessing/presetResolver.js";
-import { normalizeRequestedOptions, isPremiumPresetRequested } from "../services/videoProcessing/videoPreset.schema.js";
+import { resolveEffectivePreset } from "../services/presetResolver.js";
 
-const JOB_DEADLINE_MS =
-  Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000; // 12 minutes par défaut
+global.fetch = fetch;
+
+const JOB_DEADLINE_MS = Number(process.env.JOB_DEADLINE_MS) || 12 * 60 * 1000;
 
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
 
@@ -55,48 +56,6 @@ async function failJobTimeoutIfNeeded(job) {
   }
 }
 
-// --------------------
-// Premium options helpers (controller-side)
-// --------------------
-function isPremiumFromCaps(caps) {
-  if (!caps) return false;
-  const flags = caps.flags || caps.capabilities || {};
-  return Boolean(
-    caps.isPremiumEvent ||
-      caps.is_premium_event ||
-      caps.isPremiumAccount ||
-      caps.is_premium_account ||
-      flags.isPremiumEvent ||
-      flags.is_premium_event ||
-      flags.isPremiumAccount ||
-      flags.is_premium_account ||
-      (caps.premium && (caps.premium.event || caps.premium.account))
-  );
-}
-
-function overlayPreset(base, requested) {
-  const out = { ...(base || {}) };
-  const ro = requested || {};
-
-  if (ro.transition) out.transition = ro.transition;
-  if (typeof ro.transitionDuration === "number") out.transitionDuration = ro.transitionDuration;
-
-  if (ro.intro && typeof ro.intro === "object") {
-    out.intro = { ...(out.intro || {}), ...ro.intro };
-  }
-  if (ro.outro && typeof ro.outro === "object") {
-    out.outro = { ...(out.outro || {}), ...ro.outro };
-  }
-  if (ro.music && typeof ro.music === "object") {
-    out.music = { ...(out.music || {}), ...ro.music };
-  }
-
-  return out;
-}
-
-
-global.fetch = fetch;
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const execAsync = util.promisify(exec);
@@ -111,13 +70,13 @@ const supabase = createClient(
 );
 
 // ------------------------------------------------------
-// ✅ Constantes upload (identiques à server.js)
+// ✅ Constantes upload
 // ------------------------------------------------------
 const ALLOWED_MIME_TYPES = [
   "video/mp4",
-  "video/quicktime", // .mov
+  "video/quicktime",
   "video/webm",
-  "video/x-matroska", // .mkv (optionnel)
+  "video/x-matroska",
 ];
 
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_UPLOAD_MB || 50);
@@ -127,7 +86,7 @@ const tmp = path.join(__dirname, "..", "tmp");
 if (!fs.existsSync(tmp)) fs.mkdirSync(tmp, { recursive: true });
 
 // ------------------------------------------------------
-// Helpers (identiques à server.js)
+// Helpers
 // ------------------------------------------------------
 function sanitizeFileName(name = "video") {
   const base = String(name)
@@ -236,58 +195,9 @@ function getBucketAndPathFromPublicUrl(publicUrl) {
   }
 }
 
-// stubs (comme server.js)
+// stubs
 async function notifyNewFinalVideo() {
   return;
-}
-
-// ------------------------------------------------------
-// ✅ Étape 12: guard minimal anti-abus storagePath (premium-assets)
-// ------------------------------------------------------
-function normalizeStoragePath(p) {
-  return String(p || "").replace(/^\/+/, "").replace(/\\/g, "/").trim();
-}
-
-function isAllowedPremiumAssetPath({ storagePath, userId, eventId }) {
-  const p = normalizeStoragePath(storagePath);
-  if (!p) return false;
-  if (p.includes("..")) return false;
-
-  // autorise soit sous users/<userId>/..., soit sous events/<eventId>/...
-  const okUser = userId ? p.startsWith(`users/${userId}/`) : false;
-  const okEvent = eventId ? p.startsWith(`events/${eventId}/`) : false;
-
-  return okUser || okEvent;
-}
-
-function sanitizePresetAssetPaths({ preset, userId, eventId }) {
-  if (!preset || typeof preset !== "object") return preset;
-
-  const out = JSON.parse(JSON.stringify(preset));
-
-  // intro/outro custom_image
-  if (out?.intro?.type === "custom_image" && out?.intro?.storagePath) {
-    if (!isAllowedPremiumAssetPath({ storagePath: out.intro.storagePath, userId, eventId })) {
-      out.intro.storagePath = null;
-      out.intro.type = "default";
-    }
-  }
-
-  if (out?.outro?.type === "custom_image" && out?.outro?.storagePath) {
-    if (!isAllowedPremiumAssetPath({ storagePath: out.outro.storagePath, userId, eventId })) {
-      out.outro.storagePath = null;
-      out.outro.type = "default";
-    }
-  }
-
-  // musique
-  if (out?.music?.mode && out.music.mode !== "none" && out?.music?.storagePath) {
-    if (!isAllowedPremiumAssetPath({ storagePath: out.music.storagePath, userId, eventId })) {
-      out.music.storagePath = null; // fallback signature.mp3 côté processVideo
-    }
-  }
-
-  return out;
 }
 
 // ------------------------------------------------------
@@ -318,13 +228,7 @@ export async function uploadVideo(req, res) {
   }
 
   if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-    await logRejectedUpload({
-      req,
-      reason: "MIME type non autorisé",
-      file,
-      eventId,
-      participantName,
-    });
+    await logRejectedUpload({ req, reason: "MIME type non autorisé", file, eventId, participantName });
 
     if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -357,26 +261,14 @@ export async function uploadVideo(req, res) {
       .single();
 
     if (eventError || !event) {
-      await logRejectedUpload({
-        req,
-        reason: "Événement introuvable",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "Événement introuvable", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
       return res.status(404).json({ error: "Événement introuvable." });
     }
 
     if (event.status !== "open") {
-      await logRejectedUpload({
-        req,
-        reason: "Événement non open",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "Événement non open", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -388,13 +280,7 @@ export async function uploadVideo(req, res) {
     const caps = await computeEventCapabilities({ userId, eventId });
 
     if (!caps?.role?.isCreator && !caps?.role?.isInvited) {
-      await logRejectedUpload({
-        req,
-        reason: "Participant non autorisé (capabilities)",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "Participant non autorisé (capabilities)", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -408,13 +294,7 @@ export async function uploadVideo(req, res) {
     }
 
     if (!caps.actions?.canUploadVideo) {
-      await logRejectedUpload({
-        req,
-        reason: "UPLOAD_FORBIDDEN (capabilities)",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "UPLOAD_FORBIDDEN (capabilities)", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -428,13 +308,7 @@ export async function uploadVideo(req, res) {
     }
 
     if (caps.state?.hasReachedUploadLimit) {
-      await logRejectedUpload({
-        req,
-        reason: "UPLOAD_LIMIT_REACHED (capabilities)",
-        file,
-        eventId,
-        participantName,
-      });
+      await logRejectedUpload({ req, reason: "UPLOAD_LIMIT_REACHED (capabilities)", file, eventId, participantName });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -486,14 +360,7 @@ export async function uploadVideo(req, res) {
     const duration = await getVideoDuration(file.path);
 
     if (duration && duration > 30) {
-      await logRejectedUpload({
-        req,
-        reason: "Durée vidéo > 30 secondes",
-        file,
-        eventId,
-        participantName,
-        duration,
-      });
+      await logRejectedUpload({ req, reason: "Durée vidéo > 30 secondes", file, eventId, participantName, duration });
 
       if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
 
@@ -622,7 +489,7 @@ export async function processVideoSync(req, res) {
   try {
     const { data: event, error: eventError } = await supabase
       .from("events")
-      .select("id, title, theme, status")
+      .select("id, title, theme, status, user_id")
       .eq("id", eventId)
       .single();
 
@@ -680,44 +547,47 @@ export async function processVideoSync(req, res) {
       });
     }
 
-    const requestedOptions = normalizeRequestedOptions(options || {});
-    let effectivePreset = {
-      constraints: { maxSelectableClips: maxAllowed },
-      ...resolvePreset({ caps, requestedOptions }),
-    };
-
-    // 🧩 Controller proof logs (options + caps + preset)
-    console.log("🎯 CONTROLLER RECEIVED OPTIONS", { eventId, userId, requestedOptions });
-    console.log("🧩 CONTROLLER CAPS", caps);
-
-    const capsPremium = isPremiumFromCaps(caps);
-    const wantsPremium = isPremiumPresetRequested(requestedOptions);
-
-    if (capsPremium || wantsPremium) {
-      if (!capsPremium && wantsPremium) {
-        console.warn("⚠️ CAPS not premium but premium options requested -> applying requested options anyway (check computeEventCapabilities).");
-      }
-      effectivePreset = overlayPreset(effectivePreset, requestedOptions);
-    }
-
-    console.log("🎛️ EFFECTIVE PRESET (PROOF)", {
-      transition: effectivePreset?.transition,
-      transitionDuration: effectivePreset?.transitionDuration,
-      intro: effectivePreset?.intro,
-      outro: effectivePreset?.outro,
-      music: effectivePreset?.music,
+    // ✅ Preset effectif (sans dépendances manquantes)
+    const effectivePreset = resolveEffectivePreset({
+      capabilities: caps,
+      requestedOptions: options || {},
+      userId,
+      eventId,
     });
 
-    // ✅ Anti-abus: sanitize storage paths for assets
-    effectivePreset = sanitizePresetAssetPaths({ preset: effectivePreset, userId, eventId });
+    // ✅ Crée un job même en "sync" (évite job undefined et garde comportement stable)
+    const job = await createVideoJob({
+      eventId,
+      userId,
+      requestedOptions: options || {},
+      effectivePreset,
+    });
 
-    console.log("📼 Lancement génération vidéo finale:", eventId, "vidéos:", videoIds.length);
+    await updateVideoJob(job.id, {
+      status: "processing",
+      progress: 5,
+      started_at: new Date().toISOString(),
+      error: null,
+    });
 
-    const result = await processVideo(eventId, videoIds, effectivePreset, { jobId: job.id, deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
+    console.log("📼 Lancement génération vidéo finale (sync):", { eventId, clips: videoIds.length, jobId: job.id });
+
+    const result = await processVideo(eventId, videoIds, effectivePreset, {
+      jobId: job.id,
+      deadlineMs: JOB_DEADLINE_MS,
+      startedAtMs: Date.now(),
+    });
+
     const finalVideoUrl = result?.finalVideoUrl || null;
 
     if (!finalVideoUrl) {
       console.error("❌ processVideo n'a pas retourné d'URL valide.");
+      await updateVideoJob(job.id, {
+        status: "failed",
+        progress: 0,
+        error: "Aucune URL finale retournée.",
+        finished_at: new Date().toISOString(),
+      });
       return res.status(500).json({
         error: "La génération de la vidéo finale a échoué (aucune URL retournée).",
       });
@@ -729,9 +599,18 @@ export async function processVideoSync(req, res) {
       console.error("⚠️ Vidéo générée mais notifications en erreur:", notifyErr);
     }
 
+    await updateVideoJob(job.id, {
+      status: "done",
+      progress: 100,
+      final_video_url: finalVideoUrl,
+      finished_at: new Date().toISOString(),
+      error: null,
+    });
+
     return res.status(200).json({
       message: "Vidéo finale générée avec succès.",
       finalVideoUrl,
+      jobId: job.id,
     });
   } catch (err) {
     console.error("❌ Erreur POST /api/videos/process:", err);
@@ -804,42 +683,17 @@ export async function processVideoAsync(req, res) {
       });
     }
 
-    const requestedOptions = normalizeRequestedOptions(options || {});
-    let effectivePreset = {
-      constraints: { maxSelectableClips: maxAllowed },
-      ...resolvePreset({ caps, requestedOptions }),
-    };
-
-    // ✅ Étape 12: anti-abus storagePath avant job/montage
-    // 🧩 Controller proof logs (options + caps + preset)
-    console.log("🎯 CONTROLLER RECEIVED OPTIONS", { eventId, userId, requestedOptions });
-    console.log("🧩 CONTROLLER CAPS", caps);
-
-    const capsPremium = isPremiumFromCaps(caps);
-    const wantsPremium = isPremiumPresetRequested(requestedOptions);
-
-    if (capsPremium || wantsPremium) {
-      if (!capsPremium && wantsPremium) {
-        console.warn("⚠️ CAPS not premium but premium options requested -> applying requested options anyway (check computeEventCapabilities).");
-      }
-      effectivePreset = overlayPreset(effectivePreset, requestedOptions);
-    }
-
-    console.log("🎛️ EFFECTIVE PRESET (PROOF)", {
-      transition: effectivePreset?.transition,
-      transitionDuration: effectivePreset?.transitionDuration,
-      intro: effectivePreset?.intro,
-      outro: effectivePreset?.outro,
-      music: effectivePreset?.music,
+    const effectivePreset = resolveEffectivePreset({
+      capabilities: caps,
+      requestedOptions: options || {},
+      userId,
+      eventId,
     });
-
-    // ✅ Anti-abus: sanitize storage paths for assets
-    effectivePreset = sanitizePresetAssetPaths({ preset: effectivePreset, userId, eventId });
 
     const job = await createVideoJob({
       eventId,
       userId,
-      requestedOptions,
+      requestedOptions: options || {},
       effectivePreset,
     });
 
@@ -852,8 +706,12 @@ export async function processVideoAsync(req, res) {
           error: null,
         });
 
-        // ✅ IMPORTANT: passer effectivePreset au processVideo
-        const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
+        const result = await processVideo(eventId, videoIds, effectivePreset, {
+          jobId: job.id,
+          deadlineMs: JOB_DEADLINE_MS,
+          startedAtMs: Date.now(),
+        });
+
         const finalVideoUrl = result?.finalVideoUrl || null;
 
         await updateVideoJob(job.id, {
@@ -861,6 +719,7 @@ export async function processVideoAsync(req, res) {
           progress: 100,
           final_video_url: finalVideoUrl,
           finished_at: new Date().toISOString(),
+          error: null,
         });
       } catch (e) {
         console.error("❌ Job montage failed:", e);
@@ -900,7 +759,6 @@ export async function getJobStatus(req, res) {
   try {
     const job = await getVideoJob(jobId);
 
-    // ⏱️ Deadline serveur: si un job reste en processing trop longtemps, on le passe en failed.
     const jobAfterDeadline = await failJobTimeoutIfNeeded(job);
     const safeJob = jobAfterDeadline || job;
 
@@ -929,17 +787,15 @@ export async function getJobStatus(req, res) {
       userId: safeJob.user_id,
       status: safeJob.status,
       progress: mergedProgress,
-      step: runtime?.step || null,
+      step: runtime?.step || safeJob.step || null,
       ffmpeg: runtime
         ? {
             percent: runtime.percent ?? null,
             step: runtime.step ?? null,
-            frames: runtime.frames ?? null,
-            fps: runtime.fps ?? null,
-            speed: runtime.speed ?? null,
             outTimeSec: runtime.outTimeSec ?? null,
             totalSec: runtime.totalSec ?? null,
             updatedAt: runtime.updatedAt ?? null,
+            error: runtime.error ?? null,
           }
         : null,
       requestedOptions: safeJob.requested_options,
@@ -958,13 +814,11 @@ export async function getJobStatus(req, res) {
   }
 }
 
-// ===================== ADMIN: kill / retry job =====================
+// ===================== ADMIN =====================
 
 export async function adminKillJob(req, res) {
   if (!isAdmin(req)) {
-    return res
-      .status(401)
-      .json({ error: "Accès non autorisé (admin key invalide)." });
+    return res.status(401).json({ error: "Accès non autorisé (admin key invalide)." });
   }
 
   const { jobId } = req.params;
@@ -990,9 +844,7 @@ export async function adminKillJob(req, res) {
 
 export async function adminRetryJob(req, res) {
   if (!isAdmin(req)) {
-    return res
-      .status(401)
-      .json({ error: "Accès non autorisé (admin key invalide)." });
+    return res.status(401).json({ error: "Accès non autorisé (admin key invalide)." });
   }
 
   const { jobId } = req.params;
@@ -1002,7 +854,6 @@ export async function adminRetryJob(req, res) {
     const prev = await getVideoJob(jobId);
     if (!prev) return res.status(404).json({ error: "Job introuvable." });
 
-    // Marque l'ancien job pour audit
     try {
       if (prev.status === "processing") {
         await updateVideoJob(jobId, {
@@ -1014,18 +865,20 @@ export async function adminRetryJob(req, res) {
       }
     } catch (_) {}
 
-    // Nouveau job (plus sûr que de reset le même id)
     const newJob = await createVideoJob({
-      event_id: prev.event_id,
-      user_id: prev.user_id,
-      status: "processing",
-      progress: 5,
-      requested_options: prev.requested_options || {},
-      effective_preset: prev.effective_preset || {},
-      started_at: new Date().toISOString(),
+      eventId: prev.event_id,
+      userId: prev.user_id,
+      requestedOptions: prev.requested_options || {},
+      effectivePreset: prev.effective_preset || {},
     });
 
-    // Lance le montage en arrière-plan
+    await updateVideoJob(newJob.id, {
+      status: "processing",
+      progress: 5,
+      started_at: new Date().toISOString(),
+      error: null,
+    });
+
     setImmediate(async () => {
       try {
         const eventId = newJob.event_id;
@@ -1075,11 +928,10 @@ export async function adminRetryJob(req, res) {
       message: "Retry lancé.",
       previousJobId: jobId,
       newJobId: newJob.id,
-      status: newJob.status,
+      status: "processing",
     });
   } catch (e) {
     console.error("❌ adminRetryJob error:", e);
     return res.status(500).json({ error: "Erreur interne (adminRetryJob)." });
   }
 }
-

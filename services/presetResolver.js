@@ -7,6 +7,9 @@ const DEFAULT_PRESET = {
   intro: { enabled: true, type: "default", storagePath: null, text: null },
   outro: { enabled: true, type: "default", storagePath: null, text: null },
   music: { mode: "none", volume: 0.6, storagePath: null, ducking: false },
+
+  // ✅ NEW: watermark option (default ON)
+  watermark: { enabled: true },
 };
 
 function asNumber(v, fallback) {
@@ -49,6 +52,13 @@ function normalizeRequestedOptions(requested) {
       storagePath: safeString(r?.music?.storagePath, null),
       ducking: Boolean(r?.music?.ducking),
     },
+
+    // ✅ NEW: watermark option
+    // - default true
+    // - if explicitly false => user wants to remove watermark (premium only)
+    watermark: {
+      enabled: r?.watermark?.enabled !== false,
+    },
   };
 }
 
@@ -64,6 +74,9 @@ function sanitizeForFreeTier(normalized) {
     intro: { ...DEFAULT_PRESET.intro },
     outro: { ...DEFAULT_PRESET.outro },
     music: { ...DEFAULT_PRESET.music, mode: "none", storagePath: null, ducking: false },
+
+    // ✅ Free tier: watermark forced ON
+    watermark: { enabled: true },
   };
 }
 
@@ -134,6 +147,9 @@ function sanitizeForPremium(normalized, ctx) {
 
   const ducking = Boolean(normalized.music.ducking);
 
+  // ✅ NEW: watermark allowed OFF only for premium
+  const watermarkEnabled = normalized?.watermark?.enabled !== false;
+
   return {
     transition,
     transitionDuration: clamp(normalized.transitionDuration, 0.1, 2),
@@ -155,6 +171,9 @@ function sanitizeForPremium(normalized, ctx) {
       storagePath: musicStoragePath,
       ducking: musicMode === "none" ? false : ducking,
     },
+
+    // ✅ NEW
+    watermark: { enabled: watermarkEnabled },
   };
 }
 
@@ -178,4 +197,14 @@ export function resolveEffectivePreset({ capabilities, requestedOptions, userId,
   }
 
   return sanitizeForPremium(normalized, { userId, eventId });
+}
+
+// ✅ Alias compat (si ton controller/ancien code attend resolvePreset)
+export function resolvePreset({ caps, requestedOptions, userId, eventId }) {
+  return resolveEffectivePreset({
+    capabilities: caps,
+    requestedOptions,
+    userId,
+    eventId,
+  });
 }

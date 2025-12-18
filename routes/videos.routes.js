@@ -16,13 +16,13 @@ const router = Router();
 // Upload vidéo
 router.post("/upload", upload.single("video"), uploadVideo);
 
-// Delete vidéo
-router.delete("/:videoId", deleteVideo);
+// ✅ Delete vidéo (param aligné sur controller: req.params.id)
+router.delete("/:id", deleteVideo);
 
-// Génération sync (inchangé)
+// Génération sync
 router.post("/process", processVideoSync);
 
-// Génération async (nouveau)
+// Génération async
 router.post("/process-async", processVideoAsync);
 
 // Statut job

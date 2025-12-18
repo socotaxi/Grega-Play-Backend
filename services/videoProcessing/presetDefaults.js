@@ -1,5 +1,8 @@
 export const DEFAULT_PRESET = {
   transition: "modern_1", // placeholder
+  watermark: {
+    enabled: true,
+  },
   music: {
     mode: "none", // none | full | intro_outro
     trackUrl: null,

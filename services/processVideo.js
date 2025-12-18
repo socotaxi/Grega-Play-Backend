@@ -1,7 +1,8 @@
 // services/processVideo.js (ESM)
-// Updated: stream summary propre, logs JSON lisibles Railway, gestion audio absent,
-// statut failed + error, progression FFmpeg sur commandes critiques.
-// IMPORTANT: aucune dépendance à videoPreset.schema.js (évite crash Railway).
+// V3 COMPLETE (fidèle) : Premium ACTIF (intro/outro custom + musique) + export getVideoJobStatus
+// FIX CRITIQUE: premium-assets peut être privé => ne pas utiliser getPublicUrl().
+// FIX TRANSITIONS: support des clés UI/schema (modern_1..modern_5) + noms xfade directs.
+// FIX BUG: "capabilities is not defined" (watermarkEnabled devait venir du preset, pas d'une variable inexistante)
 
 import path from "path";
 import fs from "fs";
@@ -23,7 +24,7 @@ const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
 
-// ---- Build stamp (utile pour vérifier que Railway exécute bien CE fichier)
+// ---- Build stamp
 const BUILD_STAMP_PROCESSVIDEO =
   process.env.RAILWAY_GIT_COMMIT_SHA ||
   process.env.VERCEL_GIT_COMMIT_SHA ||
@@ -31,13 +32,37 @@ const BUILD_STAMP_PROCESSVIDEO =
 console.log("🧩 processVideo.js build:", BUILD_STAMP_PROCESSVIDEO);
 
 // ---- Sécurités
-const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 20 * 60 * 1000); // 20 min
-const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024); // 50MB
+const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 20 * 60 * 1000);
+const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024);
 
 // ------------------------------------------------------
-// PRESET minimal inline (remplace videoPreset.schema.js)
+// ✅ Runtime job map (pour getVideoJobStatus)
+// ------------------------------------------------------
+const RUNTIME_JOBS = new Map();
+
+function setRuntime(jobId, patch) {
+  if (!jobId) return;
+  const prev = RUNTIME_JOBS.get(jobId) || {};
+  RUNTIME_JOBS.set(jobId, { ...prev, ...patch, updatedAt: new Date().toISOString() });
+}
+
+export function getVideoJobStatus(jobId) {
+  if (!jobId) return null;
+  return RUNTIME_JOBS.get(jobId) || null;
+}
+
+// ------------------------------------------------------
+// ✅ TRANSITIONS: support UI/schema (modern_1..5) + noms xfade directs
 // ------------------------------------------------------
 const TRANSITION_MAP = {
+  // keys from UI/schema
+  modern_1: "fadeblack",
+  modern_2: "smoothleft",
+  modern_3: "smoothright",
+  modern_4: "circleopen",
+  modern_5: "pixelize",
+
+  // direct xfade names
   fadeblack: "fadeblack",
   fade: "fade",
   circleopen: "circleopen",
@@ -68,18 +93,49 @@ function normalizeEffectivePreset(p) {
 
 function safePreset(p) {
   const obj = p && typeof p === "object" ? p : {};
-  const transitionRaw = typeof obj.transition === "string" ? obj.transition : "fadeblack";
-  const transition = TRANSITION_MAP[transitionRaw] ? transitionRaw : "fadeblack";
+
+  // transition can come as:
+  // - string: "modern_2" or "smoothleft"
+  // - object: { value: "modern_2" } or { id: "modern_2" }
+  const transitionCandidate =
+    typeof obj.transition === "string"
+      ? obj.transition
+      : typeof obj.transition?.value === "string"
+        ? obj.transition.value
+        : typeof obj.transition?.id === "string"
+          ? obj.transition.id
+          : typeof obj.transition_key === "string"
+            ? obj.transition_key
+            : typeof obj.transitionKey === "string"
+              ? obj.transitionKey
+              : null;
+
+  const transitionRaw = (transitionCandidate || "modern_1").trim();
+  const transition = TRANSITION_MAP[transitionRaw] ? transitionRaw : "modern_1";
+
   const transitionDuration = Math.max(
     0.05,
-    Math.min(2, Number(obj.transitionDuration ?? obj.transition_duration ?? 0.3) || 0.3)
+    Math.min(
+      2,
+      Number(
+        obj.transitionDuration ??
+          obj.transition_duration ??
+          obj.transition?.duration ??
+          obj.transition?.transitionDuration ??
+          0.3
+      ) || 0.3
+    )
   );
 
   const intro = obj.intro && typeof obj.intro === "object" ? obj.intro : { type: "default" };
   const outro = obj.outro && typeof obj.outro === "object" ? obj.outro : { type: "default" };
   const music = obj.music && typeof obj.music === "object" ? obj.music : { mode: "none" };
 
-  return { transition, transitionDuration, intro, outro, music };
+  // ✅ Watermark (default true)
+  const watermarkObj = obj.watermark && typeof obj.watermark === "object" ? obj.watermark : {};
+  const watermark = { enabled: watermarkObj.enabled !== false };
+
+  return { transition, transitionDuration, intro, outro, music, watermark };
 }
 
 function resolveTransitionName(presetSafe) {
@@ -95,7 +151,6 @@ function resolveTransitionDuration(presetSafe) {
 // Utils logs
 // ------------------------------------------------------
 function logJson(tag, payload) {
-  // 1 JSON par ligne => Railway lisible même avec plusieurs jobs
   try {
     console.log(tag, JSON.stringify(payload));
   } catch {
@@ -112,7 +167,7 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // ------------------------------------------------------
-// Command exec helper (avec timeout / buffer)
+// Command exec helper
 // ------------------------------------------------------
 async function runCmd(cmd, { label = "cmd" } = {}) {
   try {
@@ -131,7 +186,7 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
 }
 
 // ------------------------------------------------------
-// FFmpeg runner avec progression (stderr time=...)
+// FFmpeg runner avec progression
 // ------------------------------------------------------
 function parseFfmpegTimeToSeconds(t) {
   if (!t) return null;
@@ -171,6 +226,12 @@ async function runFfmpegWithProgress(
     error: null,
   });
 
+  setRuntime(jobId, {
+    step,
+    percent: Math.max(0, Math.min(100, progressBase)),
+    totalSec: totalDurationSec ?? null,
+  });
+
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, { shell: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 
@@ -185,6 +246,7 @@ async function runFfmpegWithProgress(
       } catch {}
       const err = new Error(`Timeout FFmpeg (${label}) after ${FFMPEG_TIMEOUT_MS}ms`);
       safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
+      setRuntime(jobId, { step, percent: 100, error: err.message });
       reject(err);
     }, FFMPEG_TIMEOUT_MS);
 
@@ -213,6 +275,13 @@ async function runFfmpegWithProgress(
 
         const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
         safeUpdate({ status: "processing", step, progress: global, message: message || step });
+
+        setRuntime(jobId, {
+          step,
+          percent: global,
+          outTimeSec: tSec,
+          totalSec: totalDurationSec,
+        });
       });
     }
 
@@ -220,6 +289,7 @@ async function runFfmpegWithProgress(
       clearTimeout(killTimer);
       const msg = err?.message || "ffmpeg error";
       safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
+      setRuntime(jobId, { step, percent: 100, error: msg });
       reject(err);
     });
 
@@ -233,18 +303,20 @@ async function runFfmpegWithProgress(
           message: message || step,
           error: null,
         });
+        setRuntime(jobId, { step, percent: Math.max(0, Math.min(100, progressBase + progressSpan)) });
         return resolve({ stdout: stdoutAll, stderr: stderrAll });
       }
       const tail = String(stderrAll || stdoutAll).slice(-4000);
       const msg = `Erreur FFmpeg (${label}) code=${code}: ${tail}`;
       safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
+      setRuntime(jobId, { step, percent: 100, error: msg });
       reject(new Error(msg));
     });
   });
 }
 
 // ------------------------------------------------------
-// ffprobe: stream summary propre (type-specific)
+// ffprobe summary
 // ------------------------------------------------------
 function parseRationalToNumber(val) {
   if (!val || typeof val !== "string") return null;
@@ -284,7 +356,12 @@ function summarizeProbeStreams(streams = []) {
       if (t === "audio") {
         const sr = s.sample_rate != null ? Number(s.sample_rate) : undefined;
         const ch = s.channels != null ? Number(s.channels) : undefined;
-        const out = { type: "audio", codec: s.codec_name, sr: Number.isFinite(sr) ? sr : undefined, ch: Number.isFinite(ch) ? ch : undefined };
+        const out = {
+          type: "audio",
+          codec: s.codec_name,
+          sr: Number.isFinite(sr) ? sr : undefined,
+          ch: Number.isFinite(ch) ? ch : undefined,
+        };
         Object.keys(out).forEach((k) => (out[k] == null ? delete out[k] : null));
         return out;
       }
@@ -341,7 +418,7 @@ function getVideoDuration(inputPath) {
 }
 
 // ------------------------------------------------------
-// Download helper
+// Download helper (HTTP) pour vidéos publiques
 // ------------------------------------------------------
 function downloadFile(url, outputPath) {
   return new Promise((resolve, reject) => {
@@ -361,7 +438,124 @@ function downloadFile(url, outputPath) {
 }
 
 // ------------------------------------------------------
-// Normalisation robuste (audio absent => piste silencieuse)
+// ✅ FIX PREMIUM: téléchargement via storage.download() (bucket privé OK)
+// + validation simple PNG/MP3/WAV
+// ------------------------------------------------------
+function isLikelyPng(buf) {
+  if (!buf || buf.length < 8) return false;
+  return (
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47 &&
+    buf[4] === 0x0d &&
+    buf[5] === 0x0a &&
+    buf[6] === 0x1a &&
+    buf[7] === 0x0a
+  );
+}
+
+function isLikelyAudio(buf) {
+  if (!buf || buf.length < 12) return false;
+  const riff = buf.slice(0, 4).toString("ascii");
+  const wave = buf.slice(8, 12).toString("ascii");
+  if (riff === "RIFF" && wave === "WAVE") return true;
+
+  const id3 = buf.slice(0, 3).toString("ascii");
+  if (id3 === "ID3") return true;
+  if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return true;
+
+  return false;
+}
+
+async function downloadFromSupabaseBucket(bucket, storagePath, localPath, { expect = "binary" } = {}) {
+  const { data, error } = await supabase.storage.from(bucket).download(storagePath);
+  if (error || !data) {
+    logJson("❌ supabase.storage.download failed", { bucket, storagePath, error: error?.message || String(error) });
+    return false;
+  }
+
+  const ab = await data.arrayBuffer();
+  const buf = Buffer.from(ab);
+
+  if (expect === "png" && !isLikelyPng(buf)) {
+    logJson("❌ premium asset not PNG", {
+      bucket,
+      storagePath,
+      localPath,
+      head: buf.slice(0, 32).toString("utf8"),
+    });
+    return false;
+  }
+
+  if (expect === "audio" && !isLikelyAudio(buf)) {
+    logJson("❌ premium asset not AUDIO", {
+      bucket,
+      storagePath,
+      localPath,
+      head: buf.slice(0, 32).toString("utf8"),
+    });
+    return false;
+  }
+
+  await fs.promises.mkdir(path.dirname(localPath), { recursive: true });
+  await fs.promises.writeFile(localPath, buf);
+  return fs.existsSync(localPath);
+}
+
+async function renderTextToPng(text, outPath) {
+  const safe = String(text || "").replace(/'/g, "\\'");
+  const cmd =
+    `ffmpeg -y -f lavfi -i color=c=black:s=720x1280 ` +
+    `-vf "drawtext=text='${safe}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+    `-frames:v 1 "${outPath}"`;
+  await runCmd(cmd, { label: "renderTextToPng" });
+  return fs.existsSync(outPath);
+}
+
+async function resolveIntroOutroPath(kind, presetPart, tempDir) {
+  const fallback =
+    kind === "intro"
+      ? path.join(__dirname, "assets", "intro.png")
+      : path.join(__dirname, "assets", "outro.png");
+
+  const p = presetPart && typeof presetPart === "object" ? presetPart : { type: "default" };
+  const type = String(p.type || "default");
+
+  if (type === "custom_image" && p.storagePath) {
+    const local = path.join(tempDir, `premium_${kind}_${Date.now()}_${path.basename(p.storagePath)}`);
+    if (!fs.existsSync(local)) {
+      const ok = await downloadFromSupabaseBucket("premium-assets", p.storagePath, local, { expect: "png" }).catch(() => false);
+      if (!ok) return fallback;
+    }
+    return fs.existsSync(local) ? local : fallback;
+  }
+
+  if (type === "custom_text" && p.text) {
+    const local = path.join(tempDir, `premium_${kind}_text_${Date.now()}.png`);
+    await renderTextToPng(p.text, local).catch(() => false);
+    return fs.existsSync(local) ? local : fallback;
+  }
+
+  return fallback;
+}
+
+async function resolveMusicPath(musicPreset, tempDir) {
+  const m = musicPreset && typeof musicPreset === "object" ? musicPreset : { mode: "none" };
+  const mode = String(m.mode || "none");
+  if (mode === "none") return null;
+  if (!m.storagePath) return null;
+
+  const local = path.join(tempDir, `premium_music_${Date.now()}_${path.basename(m.storagePath)}`);
+  if (!fs.existsSync(local)) {
+    const ok = await downloadFromSupabaseBucket("premium-assets", m.storagePath, local, { expect: "audio" }).catch(() => false);
+    if (!ok) return null;
+  }
+  return fs.existsSync(local) ? local : null;
+}
+
+// ------------------------------------------------------
+// Normalisation robuste
 // ------------------------------------------------------
 async function normalizeVideo(
   inputPath,
@@ -507,7 +701,7 @@ async function runFFmpegFilterConcat(
 }
 
 // ------------------------------------------------------
-// Intro/Outro (simple + audio bed) + watermark (critique)
+// Intro/Outro + musique (premium) + watermark
 // ------------------------------------------------------
 async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, { jobId, progressBase = 60, progressSpan = 25 } = {}) {
   const introDur = 3;
@@ -517,7 +711,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
 
   const coreHasAudio = await hasAudioStream(corePath);
 
-  const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
+  const silenceInput = `-f lavfi -t 23 -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
 
   let filter;
   if (coreHasAudio) {
@@ -526,7 +720,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
       `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
       `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
       `[v0][v1][v2]concat=n=3:v=1:a=0[v];` +
-      `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
+      `[1:a]adelay=3000|3000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
       `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[bed];` +
       `[bed][voice]amix=inputs=2:duration=longest[a]`;
   } else {
@@ -556,8 +750,78 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
   });
 }
 
+async function addIntroOutroWithMusic(
+  corePath,
+  outputPath,
+  introPath,
+  outroPath,
+  musicPath,
+  musicVolume,
+  { jobId, progressBase = 60, progressSpan = 25 } = {}
+) {
+  const introDur = 3;
+  const outroDur = 2;
+  const coreDur = await getVideoDuration(corePath).catch(() => null);
+  const totalDur = introDur + (coreDur || 0) + outroDur || null;
+
+  const coreHasAudio = await hasAudioStream(corePath);
+
+  const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
+  const musicInput = `-stream_loop -1 -i "${musicPath}"`;
+
+  const vol = Number.isFinite(Number(musicVolume)) ? Number(musicVolume) : 0.6;
+
+  let filter = "";
+
+  filter +=
+    `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
+    `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
+    `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
+    `[v0][v1][v2]concat=n=3:v=1:a=0[v];`;
+
+  filter +=
+    `[4:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000,` +
+    `volume=${vol},atrim=0:${Math.max(1, Number(totalDur || 6))}[music];`;
+
+  filter +=
+    `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[bed];`;
+
+  if (coreHasAudio) {
+    filter +=
+      `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
+      `[bed][voice][music]amix=inputs=3:duration=longest[a]`;
+  } else {
+    filter +=
+      `[bed][music]amix=inputs=2:duration=longest[a]`;
+  }
+
+  const cmd =
+    `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" ` +
+    `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
+    `${silenceInput} ${musicInput} ` +
+    `-filter_complex "${filter}" ` +
+    `-map "[v]" -map "[a]" ` +
+    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
+
+  console.log("➡️ FFmpeg intro/outro + music:", cmd);
+  await runFfmpegWithProgress(cmd, {
+    jobId,
+    step: "intro_outro",
+    label: "intro_outro_music",
+    totalDurationSec: totalDur,
+    progressBase,
+    progressSpan,
+    message: "Intro/Outro + musique en cours...",
+  });
+}
+
 async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85, progressSpan = 10 } = {}) {
   const watermarkPath = path.join(process.cwd(), "assets", "watermark.png");
+
+  try {
+    await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+  } catch {}
+
   if (!fs.existsSync(watermarkPath)) {
     console.warn("⚠️ Watermark introuvable, skip:", watermarkPath);
     await fs.promises.copyFile(inputPath, outputPath);
@@ -565,11 +829,14 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
   }
 
   const dur = await getVideoDuration(inputPath).catch(() => null);
-  const filter = `movie='${watermarkPath}':loop=0,scale=150:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto`;
+
+  const filterComplex = `[1:v]scale=150:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto[v]`;
 
   const cmd =
-    `ffmpeg -y -i "${inputPath}" -vf "${filter}" ` +
-    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a copy "${outputPath}"`;
+    `ffmpeg -y -i "${inputPath}" -i "${watermarkPath}" ` +
+    `-filter_complex "${filterComplex}" -map "[v]" -map 0:a? ` +
+    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
+    `-c:a copy "${outputPath}"`;
 
   console.log("➡️ FFmpeg watermark:", cmd);
   await runFfmpegWithProgress(cmd, {
@@ -626,11 +893,9 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
   try {
     console.log(`🎬 Démarrage montage event=${eventId}`);
 
-    // event -> processing
     const { error: processingError } = await supabase.from("events").update({ status: "processing" }).eq("id", eventId);
     if (processingError) throw new Error("Impossible de lancer le montage (status processing).");
 
-    // load event
     let eventRow = null;
     const { data: ev, error: evErr } = await supabase.from("events").select("*").eq("id", eventId).single();
     if (!evErr) eventRow = ev;
@@ -640,6 +905,11 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
     const effectivePresetResolved = presetFromDb || effectivePreset || null;
 
     const proof = safePreset(effectivePresetResolved);
+
+    // ✅ FIX: watermarkEnabled doit venir DU PRESET (proof.watermark.enabled)
+    // (pas d'une variable "capabilities" ou "userChoice" inexistante)
+    const watermarkEnabled = proof?.watermark?.enabled !== false;
+
     logJson("🎛️ PRESET_RESOLVED", {
       isPremiumEvent,
       hasPresetFromDb: Boolean(presetFromDb),
@@ -649,13 +919,17 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
       intro: proof.intro?.type || "default",
       outro: proof.outro?.type || "default",
       music: proof.music?.mode || "none",
+      introStoragePath: proof.intro?.storagePath || null,
+      outroStoragePath: proof.outro?.storagePath || null,
+      musicStoragePath: proof.music?.storagePath || null,
+      resolvedTransitionName: resolveTransitionName(proof),
+      watermarkEnabled,
     });
 
     if (!Array.isArray(selectedVideoIds) || selectedVideoIds.length < 2) {
       throw new Error("Au moins 2 vidéos doivent être sélectionnées pour le montage.");
     }
 
-    // fetch selected videos
     const { data: videos, error } = await supabase
       .from("videos")
       .select("id, storage_path")
@@ -667,13 +941,11 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
     const videosToProcess = (videos || []).filter((v) => v.storage_path);
     if (videosToProcess.length < 2) throw new Error("Pas assez de vidéos valides pour lancer le montage.");
 
-    // tmp
     const tempRoot = path.join(__dirname, "tmp");
     if (!fs.existsSync(tempRoot)) fs.mkdirSync(tempRoot, { recursive: true });
     const tempDir = path.join(tempRoot, eventId);
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // normalize in small concurrency
     const processedPaths = [];
     const CONCURRENCY = 2;
 
@@ -710,37 +982,77 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const orderedProcessed = processedPaths.filter(Boolean);
 
-    // durations
     const durations = [];
     for (const p of orderedProcessed) durations.push(await getVideoDuration(p));
 
-    // concat
     const outConcat = path.join(tempDir, "final_concat.mp4");
-    const presetForConcat = safePreset(effectivePresetResolved);
 
     await runFFmpegFilterConcat(
       orderedProcessed,
       durations,
       outConcat,
-      resolveTransitionName(presetForConcat),
-      resolveTransitionDuration(presetForConcat),
+      resolveTransitionName(proof),
+      resolveTransitionDuration(proof),
       { jobId, progressBase: 35, progressSpan: 25 }
     );
 
-    // intro/outro (simple)
-    const introPath = path.join(__dirname, "assets", "intro.png");
-    const outroPath = path.join(__dirname, "assets", "outro.png");
+    // ✅ PREMIUM: resolve intro/outro/music
+    const introPath = await resolveIntroOutroPath("intro", proof.intro, tempDir);
+    const outroPath = await resolveIntroOutroPath("outro", proof.outro, tempDir);
+    const musicPath = await resolveMusicPath(proof.music, tempDir);
+
+    logJson("🧩 PREMIUM_ASSETS_RESOLVED", {
+      introPath,
+      outroPath,
+      musicPath,
+      musicMode: proof.music?.mode || "none",
+      musicVolume: proof.music?.volume ?? null,
+      transitionKey: proof.transition,
+      transitionName: resolveTransitionName(proof),
+      transitionDuration: resolveTransitionDuration(proof),
+      watermarkEnabled,
+    });
+
     const outNoWm = path.join(tempDir, "final_no_wm.mp4");
 
-    await addIntroOutroNoMusic(outConcat, outNoWm, introPath, outroPath, { jobId, progressBase: 60, progressSpan: 25 });
+    if (musicPath && (proof.music?.mode || "none") !== "none") {
+      await addIntroOutroWithMusic(
+        outConcat,
+        outNoWm,
+        introPath,
+        outroPath,
+        musicPath,
+        Number(proof.music?.volume ?? 0.6),
+        { jobId, progressBase: 60, progressSpan: 25 }
+      );
+    } else {
+      await addIntroOutroNoMusic(outConcat, outNoWm, introPath, outroPath, {
+        jobId,
+        progressBase: 60,
+        progressSpan: 25,
+      });
+    }
 
-    // watermark
     const outFinal = path.join(tempDir, "final.mp4");
-    await applyWatermark(outNoWm, outFinal, { jobId, progressBase: 85, progressSpan: 10 });
 
-    // upload
+    // ✅ Watermark conditional (sans ReferenceError)
+    if (watermarkEnabled) {
+      await applyWatermark(outNoWm, outFinal, { jobId, progressBase: 85, progressSpan: 10 });
+    } else {
+      console.log("🚫 Watermark désactivé par preset. Skip watermark.");
+      await fs.promises.copyFile(outNoWm, outFinal);
+      await jobUpdate({
+        status: "processing",
+        step: "watermark",
+        message: "Watermark désactivé (skip).",
+        error: null,
+      });
+      setRuntime(jobId, { step: "watermark", percent: 90 });
+    }
+
     if (!fs.existsSync(outFinal)) throw new Error("Vidéo finale introuvable sur disque (final.mp4).");
     await jobUpdate({ status: "processing", step: "upload", progress: 95, message: "Upload vidéo finale...", error: null });
+    setRuntime(jobId, { step: "upload", percent: 95 });
 
     const finalStoragePath = `final_videos/events/${eventId}/final_${Date.now()}.mp4`;
     const buffer = await fs.promises.readFile(outFinal);
@@ -763,14 +1075,16 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
     if (updateErr) throw new Error("Erreur mise à jour event (final_video_url).");
 
     await jobUpdate({ status: "done", step: "done", progress: 100, message: "Vidéo générée", error: null });
+    setRuntime(jobId, { step: "done", percent: 100 });
+
     return { ok: true, finalVideoUrl };
   } catch (e) {
     const errMsg = String(e?.message || e);
     console.error("❌ processVideo failed:", errMsg);
 
     await jobUpdate({ status: "failed", step: "failed", progress: 100, message: errMsg, error: errMsg });
+    setRuntime(jobId, { step: "failed", percent: 100, error: errMsg });
 
-    // best-effort: event failed
     try {
       await supabase.from("events").update({ status: "failed" }).eq("id", eventId);
     } catch {}

@@ -15,6 +15,7 @@ export function safePreset(preset) {
     : {
         transition: "modern_1",
         transitionDuration: 0.3,
+        watermark: { enabled: true },
         intro: { enabled: true, type: "default", storagePath: null, text: null },
         outro: { enabled: true, type: "default", storagePath: null, text: null },
         music: { mode: "none", volume: 0.6, storagePath: null, trackUrl: null, ducking: false },
@@ -54,10 +55,14 @@ export function normalizeRequestedOptions(options) {
   const intro = o.intro && typeof o.intro === "object" ? o.intro : {};
   const outro = o.outro && typeof o.outro === "object" ? o.outro : {};
   const music = o.music && typeof o.music === "object" ? o.music : {};
+  const watermark = o.watermark && typeof o.watermark === "object" ? o.watermark : {};
 
   const norm = {
     transition: typeof o.transition === "string" ? o.transition.trim() : "modern_1",
     transitionDuration: resolveTransitionDuration(o),
+    watermark: {
+      enabled: watermark.enabled !== false,
+    },
     intro: {
       enabled: intro.enabled !== false,
       type: typeof intro.type === "string" ? intro.type : "default",
@@ -115,6 +120,7 @@ export function isPremiumPresetRequested(requestedOptions) {
     (o.music?.mode && o.music.mode !== "none") ||
     (o.transition && o.transition !== "modern_1") ||
     (o.intro?.type && o.intro.type !== "default") ||
-    (o.outro?.type && o.outro.type !== "default")
+    (o.outro?.type && o.outro.type !== "default") ||
+    o.watermark?.enabled === false
   );
 }

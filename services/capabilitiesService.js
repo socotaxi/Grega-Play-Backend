@@ -102,12 +102,17 @@ export async function computeEventCapabilities({ userId, eventId }) {
     event.premium_event_expires_at
   );
 
-  // Premium effectif (compte OU event) : utile pour des features créateur (regen/qualité/limites montage)
-const premiumActive = accountPremiumActive || eventPremiumActive;
+  // Premium effectif (compte OU event)
+  const premiumActive = accountPremiumActive || eventPremiumActive;
 
-// Multi-upload : UNIQUEMENT compte premium (et optionnellement créateur si tu veux)
-const multiUploadActive = accountPremiumActive; // <- règle demandée
+  // Multi-upload : UNIQUEMENT compte premium (règle actuelle)
+  const multiUploadActive = accountPremiumActive;
 
+  // Watermark: obligatoire en gratuit, désactivable seulement si Premium effectif ET créateur
+  const canDisableWatermark = Boolean(isCreator && premiumActive);
+
+  // Options de montage premium (intro/outro/music/transitions/watermark) = créateur + premium effectif
+  const canUsePremiumEditing = Boolean(isCreator && premiumActive);
 
   // 4) Statut event (deadline/status)
   const now = Date.now();
@@ -122,8 +127,14 @@ const multiUploadActive = accountPremiumActive; // <- règle demandée
   const actions = {
     canUploadVideo: canAcceptUploads,
     canUploadMultipleVideos: multiUploadActive,
+
+    // montage
     canGenerateFinalVideo: isCreator,
     canRegenerateFinalVideo: isCreator && premiumActive,
+    canUsePremiumEditing,
+
+    // watermark
+    canDisableWatermark,
   };
 
   const limits = {
@@ -170,8 +181,15 @@ const multiUploadActive = accountPremiumActive; // <- règle demandée
     role,
     actions,
     limits,
+
+    // ✅ Premium flags normalisés (évite les divergences front/back)
     premium: {
       active: premiumActive,
+      isPremium: premiumActive,
+      isEffectivePremium: premiumActive,
+      isPremiumAccount: accountPremiumActive,
+      isPremiumEvent: eventPremiumActive,
+
       account: {
         active: accountPremiumActive,
         expiresAt: profile.premium_account_expires_at || null,
@@ -180,7 +198,12 @@ const multiUploadActive = accountPremiumActive; // <- règle demandée
         active: eventPremiumActive,
         expiresAt: event.premium_event_expires_at || null,
       },
+
+      // utile au front
+      canDisableWatermark,
+      canUsePremiumEditing,
     },
+
     state: {
       myUploadCount: myUploadCount || 0,
       uploadLimit,
