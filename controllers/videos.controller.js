@@ -8,7 +8,7 @@ import http from "http";
 import fetch from "cross-fetch";
 import { createClient } from "@supabase/supabase-js";
 
-import processVideo from "../services/processVideo.js";
+import processVideo, { getVideoJobStatus } from "../services/processVideo.js";
 import { computeEventCapabilities } from "../services/capabilitiesService.js";
 import { createVideoJob, updateVideoJob, getVideoJob } from "../services/db/videoJobs.repo.js";
 import { resolvePreset } from "../services/videoProcessing/presetResolver.js";
@@ -713,7 +713,7 @@ export async function processVideoSync(req, res) {
 
     console.log("📼 Lancement génération vidéo finale:", eventId, "vidéos:", videoIds.length);
 
-    const result = await processVideo(eventId, videoIds, effectivePreset, { deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
+    const result = await processVideo(eventId, videoIds, effectivePreset, { jobId: job.id, deadlineMs: JOB_DEADLINE_MS, startedAtMs: Date.now() });
     const finalVideoUrl = result?.finalVideoUrl || null;
 
     if (!finalVideoUrl) {
@@ -916,12 +916,32 @@ export async function getJobStatus(req, res) {
       });
     }
 
+    const runtime = getVideoJobStatus(jobId);
+
+    const mergedProgress =
+      runtime && typeof runtime.percent === "number"
+        ? Math.max(0, Math.min(100, Math.round(runtime.percent)))
+        : safeJob.progress;
+
     return res.status(200).json({
-      id: job.id,
+      id: safeJob.id,
       eventId: safeJob.event_id,
-      userId: job.user_id,
-      status: job.status,
-      progress: safeJob.progress,
+      userId: safeJob.user_id,
+      status: safeJob.status,
+      progress: mergedProgress,
+      step: runtime?.step || null,
+      ffmpeg: runtime
+        ? {
+            percent: runtime.percent ?? null,
+            step: runtime.step ?? null,
+            frames: runtime.frames ?? null,
+            fps: runtime.fps ?? null,
+            speed: runtime.speed ?? null,
+            outTimeSec: runtime.outTimeSec ?? null,
+            totalSec: runtime.totalSec ?? null,
+            updatedAt: runtime.updatedAt ?? null,
+          }
+        : null,
       requestedOptions: safeJob.requested_options,
       effectivePreset: safeJob.effective_preset,
       finalVideoUrl: safeJob.final_video_url || null,
