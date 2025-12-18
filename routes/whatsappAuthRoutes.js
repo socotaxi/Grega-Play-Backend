@@ -1,7 +1,7 @@
 // routes/whatsappAuthRoutes.js
 import express from "express";
 import crypto from "crypto";
-import fetch from "node-fetch";
+//import fetch from "node-fetch"; <-- A suuprimer en Prod
 import { createClient } from "@supabase/supabase-js";
 
 const router = express.Router();
@@ -21,6 +21,9 @@ const WHATSAPP_API_URL = `https://graph.facebook.com/v20.0/${process.env.WHATSAP
 const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
 
 const OTP_EXPIRATION_MINUTES = 10;
+
+const resp = await fetch(url, { method: "POST", headers, body });
+
 
 // -----------------------------------------------------
 // HELPERS
