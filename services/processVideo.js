@@ -23,7 +23,6 @@ const PROCESSVIDEO_BUILD_STAMP =
 
 console.log("🧩 processVideo.js build:", PROCESSVIDEO_BUILD_STAMP);
 
-
 global.fetch = fetch;
 dotenv.config();
 
@@ -31,13 +30,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const execAsync = promisify(exec);
-
-// ---- Build stamp
-const BUILD_STAMP_PROCESSVIDEO =
-  process.env.RAILWAY_GIT_COMMIT_SHA ||
-  process.env.VERCEL_GIT_COMMIT_SHA ||
-  `local-${Date.now()}`;
-console.log("🧩 processVideo.js build:", BUILD_STAMP_PROCESSVIDEO);
 
 // ---- Sécurités
 const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 20 * 60 * 1000);
@@ -719,7 +711,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
 
   const coreHasAudio = await hasAudioStream(corePath);
 
-  const silenceInput = `-f lavfi -t 23 -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
+  const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
 
   let filter;
   if (coreHasAudio) {
@@ -730,7 +722,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
       `[v0][v1][v2]concat=n=3:v=1:a=0[v];` +
       `[1:a]adelay=3000|3000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
       `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[bed];` +
-      `[bed][voice]amix=inputs=2:duration=longest[a]`;
+      `[bed][voice]amix=inputs=2:duration=first:dropout_transition=2[a]`;
   } else {
     filter =
       `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
@@ -744,7 +736,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
     `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" ` +
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
     `${silenceInput} -filter_complex "${filter}" ` +
-    `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
+    `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
 
   console.log("➡️ FFmpeg intro/outro:", cmd);
   await runFfmpegWithProgress(cmd, {
@@ -797,7 +789,7 @@ async function addIntroOutroWithMusic(
   if (coreHasAudio) {
     filter +=
       `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
-      `[bed][voice][music]amix=inputs=3:duration=first[a]`;
+      `[bed][voice][music]amix=inputs=3:duration=first:dropout_transition=2[a]`;
   } else {
     filter +=
       `[bed][music]amix=inputs=2:duration=shortest[a]`;
@@ -809,7 +801,7 @@ async function addIntroOutroWithMusic(
     `${silenceInput} ${musicInput} ` +
     `-filter_complex "${filter}" ` +
     `-map "[v]" -map "[a]" ` +
-    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k "${outputPath}"`;
+    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
 
   console.log("➡️ FFmpeg intro/outro + music:", cmd);
   await runFfmpegWithProgress(cmd, {
@@ -1023,12 +1015,11 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const outNoWm = path.join(tempDir, "final_no_wm.mp4");
 
-console.log("🟡 STEP_START intro_outro", {
-  eventId,
-  jobId,
-  hasMusic: Boolean(musicPath),
-});
-
+    console.log("🟡 STEP_START intro_outro", {
+      eventId,
+      jobId,
+      hasMusic: Boolean(musicPath),
+    });
 
     if (musicPath && (proof.music?.mode || "none") !== "none") {
       await addIntroOutroWithMusic(
@@ -1048,22 +1039,14 @@ console.log("🟡 STEP_START intro_outro", {
       });
     }
 
-logJson("🟢 STEP_DONE intro_outro", {
-  eventId,
-  jobId,
-  output: outNoWm,
-  exists: fs.existsSync(outNoWm),
-});
+    logJson("🟢 STEP_DONE intro_outro", {
+      eventId,
+      jobId,
+      output: outNoWm,
+      exists: fs.existsSync(outNoWm),
+    });
 
     const outFinal = path.join(tempDir, "final.mp4");
-
-    console.log("🟢 STEP_DONE intro_outro", {
-  eventId,
-  jobId,
-  output: outNoWm,
-  exists: fs.existsSync(outNoWm),
-});
-
 
     // ✅ Watermark conditional (sans ReferenceError)
     if (watermarkEnabled) {
@@ -1084,16 +1067,15 @@ logJson("🟢 STEP_DONE intro_outro", {
     await jobUpdate({ status: "processing", step: "upload", progress: 95, message: "Upload vidéo finale...", error: null });
     setRuntime(jobId, { step: "upload", percent: 95 });
 
-console.log("🟡 UPLOAD_START final_video", {
-  eventId,
-  jobId,
-  storagePath: finalStoragePath,
-  fileSize: buffer.length,
-});
-
-
     const finalStoragePath = `final_videos/events/${eventId}/final_${Date.now()}.mp4`;
     const buffer = await fs.promises.readFile(outFinal);
+
+    console.log("🟡 UPLOAD_START final_video", {
+      eventId,
+      jobId,
+      storagePath: finalStoragePath,
+      fileSize: buffer.length,
+    });
 
     const { error: uploadError } = await supabase.storage.from("videos").upload(finalStoragePath, buffer, {
       contentType: "video/mp4",
@@ -1115,12 +1097,11 @@ console.log("🟡 UPLOAD_START final_video", {
     await jobUpdate({ status: "done", step: "done", progress: 100, message: "Vidéo générée", error: null });
     setRuntime(jobId, { step: "done", percent: 100 });
 
-console.log("🟢 JOB_DONE", {
-  eventId,
-  jobId,
-  finalVideoUrl,
-});
-
+    console.log("🟢 JOB_DONE", {
+      eventId,
+      jobId,
+      finalVideoUrl,
+    });
 
     return { ok: true, finalVideoUrl };
   } catch (e) {
