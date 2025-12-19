@@ -34,6 +34,7 @@ const execAsync = promisify(exec);
 
 // ---- Sécurités
 const FFMPEG_TIMEOUT_MS = Number(process.env.FFMPEG_TIMEOUT_MS || 20 * 60 * 1000);
+const FFMPEG_INACTIVITY_MS = Number(process.env.FFMPEG_INACTIVITY_MS || 90 * 1000);
 const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024);
 
 // ------------------------------------------------------
@@ -263,11 +264,13 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
 
     child.on("error", (e) => {
       clearTimeout(killTimer);
+      clearInterval(inactivityTimer);
       reject(e);
     });
 
     child.on("close", (code) => {
       clearTimeout(killTimer);
+      clearInterval(inactivityTimer);
       if (code === 0) return resolve({ stdout, stderr });
       const tail = String(stderr || stdout).slice(-4000);
       reject(new Error(`Erreur cmd (${label}) code=${code}: ${tail}`));
@@ -339,6 +342,15 @@ async function runFfmpegWithProgress(
       args.unshift("-nostdin");
     }
 
+    // ✅ Patch: progression fiable (machine-readable) via -progress pipe:2 (sur stderr) + -nostats
+    // (ne pas ajouter si déjà présent)
+    if (bin === "ffmpeg" && !args.includes("-progress")) {
+      // Placer tôt dans la commande (après -nostdin si présent)
+      const idx = args.indexOf("-nostdin");
+      const insertAt = idx >= 0 ? idx + 1 : 0;
+      args.splice(insertAt, 0, "-progress", "pipe:2", "-nostats");
+    }
+
     const child = spawn(bin, args, {
       shell: false,
       windowsHide: true,
@@ -360,7 +372,31 @@ async function runFfmpegWithProgress(
       reject(err);
     }, FFMPEG_TIMEOUT_MS);
 
-    if (child.stdout) child.stdout.on("data", (c) => (stdoutAll += c.toString()));
+    // ✅ Patch: watchdog d'inactivité (si aucun output pendant FFMPEG_INACTIVITY_MS, on kill)
+    let lastActivityAt = Date.now();
+    const bumpActivity = () => {
+      lastActivityAt = Date.now();
+    };
+
+    const inactivityTimer = setInterval(() => {
+      const idle = Date.now() - lastActivityAt;
+      if (idle < FFMPEG_INACTIVITY_MS) return;
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      const err = new Error(`FFmpeg inactive for ${FFMPEG_INACTIVITY_MS}ms (${label})`);
+      safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
+      setRuntime(jobId, { step, percent: 100, error: err.message });
+      clearTimeout(killTimer);
+      clearInterval(inactivityTimer);
+      reject(err);
+    }, 5000);
+
+    if (child.stdout)
+      child.stdout.on("data", (c) => {
+        bumpActivity();
+        stdoutAll += c.toString();
+      });
     if (child.stderr) {
       child.stderr.on("data", (chunk) => {
         const s = chunk.toString();
@@ -1053,7 +1089,19 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
     await fs.promises.mkdir(tempDir, { recursive: true });
 
     const processedPaths = [];
-    const CONCURRENCY = 2;
+
+    // ✅ Patch: limiter la concurrence sur Railway (CPU bridé) pour éviter les stalls/temps infinis
+    const IS_RAILWAY = Boolean(
+      process.env.RAILWAY_ENVIRONMENT ||
+        process.env.RAILWAY_PROJECT_ID ||
+        process.env.RAILWAY_SERVICE_ID ||
+        process.env.RAILWAY_GIT_COMMIT_SHA ||
+        process.env.RAILWAY_STATIC_URL
+    );
+
+    const CONCURRENCY = IS_RAILWAY
+      ? 1
+      : Math.max(1, Number(process.env.VIDEO_CONCURRENCY || 2));
 
     for (let i = 0; i < videosToProcess.length; i += CONCURRENCY) {
       const slice = videosToProcess.slice(i, i + CONCURRENCY);
