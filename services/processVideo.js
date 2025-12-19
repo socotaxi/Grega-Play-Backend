@@ -1015,6 +1015,13 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const outNoWm = path.join(tempDir, "final_no_wm.mp4");
 
+console.log("🟡 STEP_START intro_outro", {
+  eventId,
+  jobId,
+  hasMusic: Boolean(musicPath),
+});
+
+
     if (musicPath && (proof.music?.mode || "none") !== "none") {
       await addIntroOutroWithMusic(
         outConcat,
@@ -1035,6 +1042,14 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const outFinal = path.join(tempDir, "final.mp4");
 
+    console.log("🟢 STEP_DONE intro_outro", {
+  eventId,
+  jobId,
+  output: outNoWm,
+  exists: fs.existsSync(outNoWm),
+});
+
+
     // ✅ Watermark conditional (sans ReferenceError)
     if (watermarkEnabled) {
       await applyWatermark(outNoWm, outFinal, { jobId, progressBase: 85, progressSpan: 10 });
@@ -1053,6 +1068,14 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
     if (!fs.existsSync(outFinal)) throw new Error("Vidéo finale introuvable sur disque (final.mp4).");
     await jobUpdate({ status: "processing", step: "upload", progress: 95, message: "Upload vidéo finale...", error: null });
     setRuntime(jobId, { step: "upload", percent: 95 });
+
+console.log("🟡 UPLOAD_START final_video", {
+  eventId,
+  jobId,
+  storagePath: finalStoragePath,
+  fileSize: buffer.length,
+});
+
 
     const finalStoragePath = `final_videos/events/${eventId}/final_${Date.now()}.mp4`;
     const buffer = await fs.promises.readFile(outFinal);
@@ -1076,6 +1099,13 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     await jobUpdate({ status: "done", step: "done", progress: 100, message: "Vidéo générée", error: null });
     setRuntime(jobId, { step: "done", percent: 100 });
+
+console.log("🟢 JOB_DONE", {
+  eventId,
+  jobId,
+  finalVideoUrl,
+});
+
 
     return { ok: true, finalVideoUrl };
   } catch (e) {
