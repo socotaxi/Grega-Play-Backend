@@ -6,6 +6,7 @@
 
 import path from "path";
 import fs from "fs";
+import os from "os";
 import { exec, spawn } from "child_process";
 import { createClient } from "@supabase/supabase-js";
 import { updateVideoJob } from "./db/videoJobs.repo.js";
@@ -94,9 +95,6 @@ function normalizeEffectivePreset(p) {
 function safePreset(p) {
   const obj = p && typeof p === "object" ? p : {};
 
-  // transition can come as:
-  // - string: "modern_2" or "smoothleft"
-  // - object: { value: "modern_2" } or { id: "modern_2" }
   const transitionCandidate =
     typeof obj.transition === "string"
       ? obj.transition
@@ -131,7 +129,6 @@ function safePreset(p) {
   const outro = obj.outro && typeof obj.outro === "object" ? obj.outro : { type: "default" };
   const music = obj.music && typeof obj.music === "object" ? obj.music : { mode: "none" };
 
-  // ✅ Watermark (default true)
   const watermarkObj = obj.watermark && typeof obj.watermark === "object" ? obj.watermark : {};
   const watermark = { enabled: watermarkObj.enabled !== false };
 
@@ -167,26 +164,119 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // ------------------------------------------------------
-// Command exec helper
+// ✅ parsing args: splitCommand (gère guillemets)
 // ------------------------------------------------------
-async function runCmd(cmd, { label = "cmd" } = {}) {
-  try {
-    const { stdout, stderr } = await execAsync(cmd, {
-      timeout: FFMPEG_TIMEOUT_MS,
-      maxBuffer: EXEC_MAX_BUFFER,
-      windowsHide: true,
-    });
-    return { stdout, stderr };
-  } catch (e) {
-    if (e && (e.killed || String(e.message || "").includes("timed out"))) {
-      e.message = `Timeout (${Math.round(FFMPEG_TIMEOUT_MS / 1000)}s) sur ${label}`;
+function splitCommand(cmd) {
+  const s = String(cmd || "").trim();
+  const out = [];
+  let cur = "";
+  let quote = null;
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else if (ch === "\\" && i + 1 < s.length) {
+        const next = s[i + 1];
+        if (next === quote || next === "\\" || next === " ") {
+          cur += next;
+          i++;
+        } else {
+          cur += ch;
+        }
+      } else {
+        cur += ch;
+      }
+      continue;
     }
-    throw e;
+
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+
+    if (ch === " " || ch === "\n" || ch === "\t") {
+      if (cur) out.push(cur);
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
   }
+
+  if (cur) out.push(cur);
+  return out;
 }
 
 // ------------------------------------------------------
-// FFmpeg runner avec progression
+// Command runner (sans shell)
+// ------------------------------------------------------
+async function runCmd(cmd, { label = "cmd" } = {}) {
+  const parts = splitCommand(cmd);
+  const bin = parts[0];
+  const args = parts.slice(1);
+
+  if (!bin) throw new Error(`Commande vide (${label})`);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, {
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+
+    const killTimer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      reject(new Error(`Timeout (${Math.round(FFMPEG_TIMEOUT_MS / 1000)}s) sur ${label}`));
+    }, FFMPEG_TIMEOUT_MS);
+
+    child.stdout?.on("data", (c) => {
+      const s = c.toString();
+      stdout += s;
+      stdoutBytes += Buffer.byteLength(s);
+      if (stdoutBytes > EXEC_MAX_BUFFER) {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }
+    });
+
+    child.stderr?.on("data", (c) => {
+      const s = c.toString();
+      stderr += s;
+      stderrBytes += Buffer.byteLength(s);
+      if (stderrBytes > EXEC_MAX_BUFFER) {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }
+    });
+
+    child.on("error", (e) => {
+      clearTimeout(killTimer);
+      reject(e);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      if (code === 0) return resolve({ stdout, stderr });
+      const tail = String(stderr || stdout).slice(-4000);
+      reject(new Error(`Erreur cmd (${label}) code=${code}: ${tail}`));
+    });
+  });
+}
+
+// ------------------------------------------------------
+// FFmpeg runner avec progression (sans shell, parsing args)
 // ------------------------------------------------------
 function parseFfmpegTimeToSeconds(t) {
   if (!t) return null;
@@ -233,7 +323,27 @@ async function runFfmpegWithProgress(
   });
 
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, { shell: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const parts = splitCommand(cmd);
+    const bin = parts[0];
+    const args = parts.slice(1);
+
+    if (!bin) {
+      const err = new Error(`Commande FFmpeg vide (${label})`);
+      safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
+      setRuntime(jobId, { step, percent: 100, error: err.message });
+      return reject(err);
+    }
+
+    // Garde-fou: éviter un hang si ffmpeg attend stdin en environnement non-interactif
+    if (bin === "ffmpeg" && !args.includes("-nostdin")) {
+      args.unshift("-nostdin");
+    }
+
+    const child = spawn(bin, args, {
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
     let stderrAll = "";
     let stdoutAll = "";
@@ -374,7 +484,7 @@ function summarizeProbeStreams(streams = []) {
 async function probeStreamsSummary(inputPath, { label = "probe" } = {}) {
   try {
     const cmd =
-      `ffprobe -v error ` +
+      `ffprobe -nostdin -v error ` +
       `-show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels:stream_tags=rotate ` +
       `-of json "${inputPath}"`;
     const { stdout } = await runCmd(cmd, { label: `probeStreamsSummary(${label})` });
@@ -389,7 +499,7 @@ async function probeStreamsSummary(inputPath, { label = "probe" } = {}) {
 
 async function hasAudioStream(inputPath) {
   try {
-    const cmd = `ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "${inputPath}"`;
+    const cmd = `ffprobe -nostdin -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "${inputPath}"`;
     const { stdout } = await runCmd(cmd, { label: "hasAudioStream(ffprobe)" });
     return String(stdout || "").trim() === "audio";
   } catch (e) {
@@ -398,23 +508,15 @@ async function hasAudioStream(inputPath) {
   }
 }
 
-function getVideoDuration(inputPath) {
-  return new Promise((resolve, reject) => {
-    const cmd = `ffprobe -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`;
-    exec(cmd, (error, stdout, stderr) => {
-      if (error) {
-        logJson("❌ ffprobe(duration) error", {
-          inputPath,
-          stderr: String(stderr || "").slice(-1000),
-          stdout: String(stdout || "").slice(-1000),
-        });
-        return reject(new Error("Erreur ffprobe (duration)"));
-      }
-      const duration = parseFloat(String(stdout).trim());
-      if (isNaN(duration)) return reject(new Error("Durée vidéo invalide"));
-      resolve(duration);
-    });
-  });
+async function getVideoDuration(inputPath) {
+  const cmd = `ffprobe -nostdin -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`;
+  const { stdout, stderr } = await runCmd(cmd, { label: "getVideoDuration(ffprobe)" });
+  const duration = parseFloat(String(stdout || "").trim());
+  if (!Number.isFinite(duration)) {
+    logJson("❌ ffprobe(duration) invalid", { inputPath, stdout: String(stdout || "").slice(-400), stderr: String(stderr || "").slice(-400) });
+    throw new Error("Durée vidéo invalide");
+  }
+  return duration;
 }
 
 // ------------------------------------------------------
@@ -506,7 +608,7 @@ async function downloadFromSupabaseBucket(bucket, storagePath, localPath, { expe
 async function renderTextToPng(text, outPath) {
   const safe = String(text || "").replace(/'/g, "\\'");
   const cmd =
-    `ffmpeg -y -f lavfi -i color=c=black:s=720x1280 ` +
+    `ffmpeg -nostdin -y -f lavfi -i color=c=black:s=720x1280 ` +
     `-vf "drawtext=text='${safe}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
     `-frames:v 1 "${outPath}"`;
   await runCmd(cmd, { label: "renderTextToPng" });
@@ -525,7 +627,9 @@ async function resolveIntroOutroPath(kind, presetPart, tempDir) {
   if (type === "custom_image" && p.storagePath) {
     const local = path.join(tempDir, `premium_${kind}_${Date.now()}_${path.basename(p.storagePath)}`);
     if (!fs.existsSync(local)) {
-      const ok = await downloadFromSupabaseBucket("premium-assets", p.storagePath, local, { expect: "png" }).catch(() => false);
+      const ok = await downloadFromSupabaseBucket("premium-assets", p.storagePath, local, { expect: "png" }).catch(
+        () => false
+      );
       if (!ok) return fallback;
     }
     return fs.existsSync(local) ? local : fallback;
@@ -548,7 +652,9 @@ async function resolveMusicPath(musicPreset, tempDir) {
 
   const local = path.join(tempDir, `premium_music_${Date.now()}_${path.basename(m.storagePath)}`);
   if (!fs.existsSync(local)) {
-    const ok = await downloadFromSupabaseBucket("premium-assets", m.storagePath, local, { expect: "audio" }).catch(() => false);
+    const ok = await downloadFromSupabaseBucket("premium-assets", m.storagePath, local, { expect: "audio" }).catch(
+      () => false
+    );
     if (!ok) return null;
   }
   return fs.existsSync(local) ? local : null;
@@ -579,15 +685,17 @@ async function normalizeVideo(
 
   let cmd = "";
   if (inputHasAudio) {
+    // ✅ normalize: -nostdin -threads 1
     cmd =
-      `ffmpeg -y -fflags +genpts -i "${inputPath}" ` +
+      `ffmpeg -nostdin -threads 1 -y -fflags +genpts -i "${inputPath}" ` +
       `-filter_complex "[0:v]${vFilter}[v];[0:a]${aFilter}[a]" ` +
       `-map "[v]" -map "[a]" ` +
       `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
       `-c:a aac -b:a 128k "${outputPath}"`;
   } else {
+    // ✅ normalize: -nostdin -threads 1
     cmd =
-      `ffmpeg -y -fflags +genpts -i "${inputPath}" ` +
+      `ffmpeg -nostdin -threads 1 -y -fflags +genpts -i "${inputPath}" ` +
       `-f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000" ` +
       `-filter_complex "[0:v]${vFilter}[v];[1:a]${aFilter}[a]" ` +
       `-map "[v]" -map "[a]" -shortest ` +
@@ -629,7 +737,7 @@ async function runFFmpegFilterConcat(
   if (n < 1) throw new Error("Aucune vidéo à concaténer");
 
   if (n === 1) {
-    const cmd = `ffmpeg -y -i "${processedPaths[0]}" -c copy "${outputPath}"`;
+    const cmd = `ffmpeg -nostdin -y -i "${processedPaths[0]}" -c copy "${outputPath}"`;
     await runFfmpegWithProgress(cmd, {
       jobId,
       step: "concat",
@@ -680,7 +788,7 @@ async function runFFmpegFilterConcat(
 
   const filter = parts.join(";");
   const cmd =
-    `ffmpeg -y ${inputs} ` +
+    `ffmpeg -nostdin -y ${inputs} ` +
     `-filter_complex "${filter}" ` +
     `-map "[${vLast}]" -map "[${aLast}]" ` +
     `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
@@ -733,7 +841,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
   }
 
   const cmd =
-    `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" ` +
+    `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
     `${silenceInput} -filter_complex "${filter}" ` +
     `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
@@ -791,12 +899,11 @@ async function addIntroOutroWithMusic(
       `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
       `[bed][voice][music]amix=inputs=3:duration=first:dropout_transition=2[a]`;
   } else {
-    filter +=
-      `[bed][music]amix=inputs=2:duration=shortest[a]`;
+    filter += `[bed][music]amix=inputs=2:duration=shortest[a]`;
   }
 
   const cmd =
-    `ffmpeg -y -loop 1 -t ${introDur} -i "${introPath}" ` +
+    `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
     `${silenceInput} ${musicInput} ` +
     `-filter_complex "${filter}" ` +
@@ -833,7 +940,7 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
   const filterComplex = `[1:v]scale=150:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto[v]`;
 
   const cmd =
-    `ffmpeg -y -i "${inputPath}" -i "${watermarkPath}" ` +
+    `ffmpeg -nostdin -y -i "${inputPath}" -i "${watermarkPath}" ` +
     `-filter_complex "${filterComplex}" -map "[v]" -map 0:a? ` +
     `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
     `-c:a copy "${outputPath}"`;
@@ -906,8 +1013,6 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const proof = safePreset(effectivePresetResolved);
 
-    // ✅ FIX: watermarkEnabled doit venir DU PRESET (proof.watermark.enabled)
-    // (pas d'une variable "capabilities" ou "userChoice" inexistante)
     const watermarkEnabled = proof?.watermark?.enabled !== false;
 
     logJson("🎛️ PRESET_RESOLVED", {
@@ -941,10 +1046,11 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
     const videosToProcess = (videos || []).filter((v) => v.storage_path);
     if (videosToProcess.length < 2) throw new Error("Pas assez de vidéos valides pour lancer le montage.");
 
-    const tempRoot = path.join(__dirname, "tmp");
-    if (!fs.existsSync(tempRoot)) fs.mkdirSync(tempRoot, { recursive: true });
+    // ✅ temp: /tmp (os.tmpdir()) sur Railway/Linux
+    const tempRoot = path.join(os.tmpdir(), "grega-play", "tmp");
+    await fs.promises.mkdir(tempRoot, { recursive: true });
     const tempDir = path.join(tempRoot, eventId);
-    fs.mkdirSync(tempDir, { recursive: true });
+    await fs.promises.mkdir(tempDir, { recursive: true });
 
     const processedPaths = [];
     const CONCURRENCY = 2;
@@ -996,7 +1102,6 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
       { jobId, progressBase: 35, progressSpan: 25 }
     );
 
-    // ✅ PREMIUM: resolve intro/outro/music
     const introPath = await resolveIntroOutroPath("intro", proof.intro, tempDir);
     const outroPath = await resolveIntroOutroPath("outro", proof.outro, tempDir);
     const musicPath = await resolveMusicPath(proof.music, tempDir);
@@ -1048,7 +1153,6 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const outFinal = path.join(tempDir, "final.mp4");
 
-    // ✅ Watermark conditional (sans ReferenceError)
     if (watermarkEnabled) {
       await applyWatermark(outNoWm, outFinal, { jobId, progressBase: 85, progressSpan: 10 });
     } else {
