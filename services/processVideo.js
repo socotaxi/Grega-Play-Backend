@@ -484,7 +484,7 @@ function summarizeProbeStreams(streams = []) {
 async function probeStreamsSummary(inputPath, { label = "probe" } = {}) {
   try {
     const cmd =
-      `ffprobe -nostdin -v error ` +
+      `ffprobe -v error ` +
       `-show_entries stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels:stream_tags=rotate ` +
       `-of json "${inputPath}"`;
     const { stdout } = await runCmd(cmd, { label: `probeStreamsSummary(${label})` });
@@ -499,7 +499,7 @@ async function probeStreamsSummary(inputPath, { label = "probe" } = {}) {
 
 async function hasAudioStream(inputPath) {
   try {
-    const cmd = `ffprobe -nostdin -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "${inputPath}"`;
+    const cmd = `ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "${inputPath}"`;
     const { stdout } = await runCmd(cmd, { label: "hasAudioStream(ffprobe)" });
     return String(stdout || "").trim() === "audio";
   } catch (e) {
@@ -509,7 +509,7 @@ async function hasAudioStream(inputPath) {
 }
 
 async function getVideoDuration(inputPath) {
-  const cmd = `ffprobe -nostdin -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`;
+  const cmd = `ffprobe -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`;
   const { stdout, stderr } = await runCmd(cmd, { label: "getVideoDuration(ffprobe)" });
   const duration = parseFloat(String(stdout || "").trim());
   if (!Number.isFinite(duration)) {
