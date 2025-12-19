@@ -6,7 +6,8 @@ const TRANSITION_MAP = {
   modern_2: "smoothleft",
   modern_3: "smoothright",
   modern_4: "circleopen",
-  modern_5: "radial",
+  modern_5: "circleopen",
+  modern_6: "radial",
 };
 
 function resolveTransitionName(v) {
@@ -97,8 +98,12 @@ export function buildFfmpegPlan({
 
       const offset = offsets[i - 1];
 
-      parts.push(`${vPrev}${vCur} xfade=transition=${transition}:duration=${transDuration}:offset=${offset} ${vOut}`);
-      parts.push(`${aPrev}${aCur} acrossfade=d=${transDuration}:c1=tri:c2=tri ${aOut}`);
+      parts.push(
+        `${vPrev}${vCur} xfade=transition=${transition}:duration=${transDuration}:offset=${offset} ${vOut}`
+      );
+      parts.push(
+        `${aPrev}${aCur} acrossfade=d=${transDuration}:c1=tri:c2=tri ${aOut}`
+      );
 
       vPrev = vOut;
       aPrev = aOut;
@@ -133,11 +138,19 @@ export function buildFfmpegPlan({
   // si intro/outro absents → on copie juste
   if (!introEnabled && !outroEnabled) {
     const cmdCopy = `ffmpeg -y -i "${outConcat}" -c copy "${outIntroOutro}"`;
-    steps.push({ name: "copy_no_intro_outro", cmd: cmdCopy, outputPath: outIntroOutro });
+    steps.push({
+      name: "copy_no_intro_outro",
+      cmd: cmdCopy,
+      outputPath: outIntroOutro,
+    });
   } else if (!introPath || !outroPath) {
     // fallback: juste copy
     const cmdCopy = `ffmpeg -y -i "${outConcat}" -c copy "${outIntroOutro}"`;
-    steps.push({ name: "copy_missing_intro_outro_assets", cmd: cmdCopy, outputPath: outIntroOutro });
+    steps.push({
+      name: "copy_missing_intro_outro_assets",
+      cmd: cmdCopy,
+      outputPath: outIntroOutro,
+    });
   } else {
     const introDur = 3;
     const outroDur = 2;
@@ -160,14 +173,25 @@ export function buildFfmpegPlan({
 -movflags +faststart \
 "${outIntroOutro}"`;
 
-      steps.push({ name: "intro_outro_no_music", cmd: cmdNoMusic, outputPath: outIntroOutro });
+      steps.push({
+        name: "intro_outro_no_music",
+        cmd: cmdNoMusic,
+        outputPath: outIntroOutro,
+      });
     } else {
-      // musique intro_outro
+      // musique intro_outro (bornée pour éviter durée énorme/infinie)
       const volume = Math.max(0.05, Math.min(1, musicVolume));
-      // on place l'outro music à la fin (offset simple via adelay)
-      // (on ne recalcul pas exact du core ici : comportement stable, simple)
-      // => si tu veux exact, on le fera à l’étape 8 avec durations globales.
-      const outroStartMs = (introDur + 9999) * 1000; // placeholder sécurisé: re-trim + amix (duration=longest)
+
+      // Durée approx du "core" (concat) en tenant compte des transitions
+      const totalClips = durations.reduce((a, b) => a + b, 0);
+      const coreDurApprox =
+        clipsPaths.length > 1
+          ? Math.max(0, totalClips - transDuration * (clipsPaths.length - 1))
+          : Math.max(0, totalClips);
+
+      // L'outro music démarre à la fin du core (après l'intro vidéo)
+      const outroStartMs = Math.round((introDur + coreDurApprox) * 1000);
+
       const cmdMusic = `ffmpeg -y \
 -loop 1 -t ${introDur} -i "${introPath}" \
 -i "${outConcat}" \
@@ -181,15 +205,20 @@ export function buildFfmpegPlan({
 [1:a]adelay=${introDur * 1000}|${introDur * 1000}[voice]; \
 [3:a]atrim=0:${introDur},asetpts=PTS-STARTPTS,volume=${volume}[m_intro]; \
 [3:a]atrim=0:${outroDur},asetpts=PTS-STARTPTS,volume=${volume},adelay=${outroStartMs}|${outroStartMs}[m_outro]; \
-[m_intro][m_outro]amix=inputs=2:duration=longest[music]; \
-[voice][music]amix=inputs=2:duration=longest[a]" \
+[m_intro][m_outro]amix=inputs=2:duration=first[music]; \
+[voice][music]amix=inputs=2:duration=first[a]" \
 -map "[v]" -map "[a]" \
 -c:v libx264 -preset veryfast -crf 26 \
 -c:a aac -b:a 96k -ar 44100 \
 -movflags +faststart \
+-shortest \
 "${outIntroOutro}"`;
 
-      steps.push({ name: "intro_outro_music_intro_outro", cmd: cmdMusic, outputPath: outIntroOutro });
+      steps.push({
+        name: "intro_outro_music_intro_outro",
+        cmd: cmdMusic,
+        outputPath: outIntroOutro,
+      });
     }
   }
 
