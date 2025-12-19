@@ -16,6 +16,14 @@ import { fileURLToPath } from "url";
 import fetch from "cross-fetch";
 import { promisify } from "util";
 
+const PROCESSVIDEO_BUILD_STAMP =
+  process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ||
+  process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ||
+  `local-${new Date().toISOString()}`;
+
+console.log("🧩 processVideo.js build:", PROCESSVIDEO_BUILD_STAMP);
+
+
 global.fetch = fetch;
 dotenv.config();
 
@@ -789,10 +797,10 @@ async function addIntroOutroWithMusic(
   if (coreHasAudio) {
     filter +=
       `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
-      `[bed][voice][music]amix=inputs=3:duration=longest[a]`;
+      `[bed][voice][music]amix=inputs=3:duration=first[a]`;
   } else {
     filter +=
-      `[bed][music]amix=inputs=2:duration=longest[a]`;
+      `[bed][music]amix=inputs=2:duration=shortest[a]`;
   }
 
   const cmd =
