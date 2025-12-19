@@ -1040,6 +1040,13 @@ console.log("🟡 STEP_START intro_outro", {
       });
     }
 
+logJson("🟢 STEP_DONE intro_outro", {
+  eventId,
+  jobId,
+  output: outNoWm,
+  exists: fs.existsSync(outNoWm),
+});
+
     const outFinal = path.join(tempDir, "final.mp4");
 
     console.log("🟢 STEP_DONE intro_outro", {
