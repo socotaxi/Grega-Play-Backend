@@ -444,8 +444,8 @@ async function runFfmpegWithProgress(
         status: "processing",
         step,
         progress: global,
-        message: message || step,
-        ffmpeg: payload,
+        // Option A: on stocke outTimeSec dans message (pas de colonne dédiée)
+        message: `${message || step} | t=${Number.isFinite(tSec) ? tSec.toFixed(1) : "?"}s`,
       });
 
       // ✅ optional callback
