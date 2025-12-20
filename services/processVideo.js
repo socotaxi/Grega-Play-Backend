@@ -264,13 +264,11 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
 
     child.on("error", (e) => {
       clearTimeout(killTimer);
-      clearInterval(inactivityTimer);
       reject(e);
     });
 
     child.on("close", (code) => {
-      clearTimeout(killTimer);
-      clearInterval(inactivityTimer);
+      clearTimeout(killTimer);      
       if (code === 0) return resolve({ stdout, stderr });
       const tail = String(stderr || stdout).slice(-4000);
       reject(new Error(`Erreur cmd (${label}) code=${code}: ${tail}`));
@@ -387,8 +385,7 @@ async function runFfmpegWithProgress(
       const err = new Error(`FFmpeg inactive for ${FFMPEG_INACTIVITY_MS}ms (${label})`);
       safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
       setRuntime(jobId, { step, percent: 100, error: err.message });
-      clearTimeout(killTimer);
-      clearInterval(inactivityTimer);
+      clearTimeout(killTimer);      
       reject(err);
     }, 5000);
 
