@@ -1008,71 +1008,83 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
   });
 }
 
-async function addIntroOutroWithMusic(
-  corePath,
-  outputPath,
-  introPath,
-  outroPath,
-  musicPath,
-  musicVolume,
-  { jobId, progressBase = 60, progressSpan = 25 } = {}
-) {
+async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, { jobId, progressBase = 60, progressSpan = 25 } = {}) {
   const introDur = 3;
   const outroDur = 2;
-  const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro_music");
-  const totalDur = introDur + (coreDur || 0) + outroDur || null;
+
+  const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro");
+  const safeCore = Number.isFinite(coreDur) ? coreDur : 0;
+  const totalDur = introDur + safeCore + outroDur; // ✅ durée finale cible (ex: 34.119)
 
   const coreHasAudio = await hasAudioStream(corePath);
 
-  const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
-  const musicInput = `-stream_loop -1 -i "${musicPath}"`;
+  // ✅ Vidéo : concat intro + core + outro, puis trim sur totalDur
+  let filter = `
+[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];
+[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];
+[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];
+[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${totalDur},setpts=PTS-STARTPTS[v];
+`;
 
-  const vol = Number.isFinite(Number(musicVolume)) ? Number(musicVolume) : 0.6;
-
-  let filter = "";
-
-  filter +=
-    `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
-    `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
-    `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
-    `[v0][v1][v2]concat=n=3:v=1:a=0[v];`;
-
-  filter +=
-    `[4:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000,` +
-    `volume=${vol},atrim=0:${Math.max(1, Number(totalDur || 6))}[music];`;
-
-  filter +=
-    `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[bed];`;
-
+  // ✅ Audio :
+  // - si core a un audio : on le décale de 3s, on remplit avec apad (silence), puis on coupe à totalDur
+  // - sinon : on crée un silence de totalDur
   if (coreHasAudio) {
-    filter +=
-      `[1:a]adelay=${introDur * 1000}|${introDur * 1000},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
-      `[bed][voice][music]amix=inputs=3:duration=first:dropout_transition=2[a]`;
+    filter += `
+[1:a]adelay=${Math.round(introDur * 1000)}|${Math.round(introDur * 1000)},
+aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,
+aresample=48000,
+apad,
+atrim=duration=${totalDur},
+asetpts=PTS-STARTPTS[a]
+`;
   } else {
-    filter += `[bed][music]amix=inputs=2:duration=shortest[a]`;
+    filter += `
+[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,
+aresample=48000,
+atrim=duration=${totalDur},
+asetpts=PTS-STARTPTS[a]
+`;
   }
 
-filter = String(filter || "").replace(/\s*\n\s*/g, " ").trim();
+  // ✅ IMPORTANT : on enlève les retours à la ligne dans -filter_complex
+  filter = String(filter).replace(/\s*\n\s*/g, " ").trim();
+
+  // ✅ Entrées :
+  // 0 = intro image (3s)
+  // 1 = core video
+  // 2 = outro image (2s)
+  // 3 = silence (uniquement utile si core n'a pas d'audio)
+  const silenceInput = coreHasAudio
+    ? ""
+    : ` -f lavfi -t ${Math.max(1, Math.ceil(totalDur))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
 
   const cmd =
-    `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
-    `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
-    `${silenceInput} ${musicInput} ` +
+    `ffmpeg -nostdin -y ` +
+    `-loop 1 -t ${introDur} -i "${introPath}" ` +
+    `-i "${corePath}" ` +
+    `-loop 1 -t ${outroDur} -i "${outroPath}"` +
+    `${silenceInput} ` +
     `-filter_complex "${filter}" ` +
     `-map "[v]" -map "[a]" ` +
-    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
+    `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
+    `-c:a aac -b:a 128k -shortest "${outputPath}"`;
 
-  console.log("➡️ FFmpeg intro/outro + music:", cmd);
+  console.log("➡️ FFmpeg intro/outro:", cmd);
+
   await runFfmpegWithProgress(cmd, {
     jobId,
     step: "intro_outro",
-    label: "intro_outro_music",
+    label: "intro_outro",
     totalDurationSec: totalDur,
     progressBase,
     progressSpan,
-    message: "Intro/Outro + musique en cours...",
+    message: "Intro/Outro en cours...",
   });
+
+  logJson("✅ Intro/Outro OK", { outputPath, totalDur });
 }
+
 
 async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85, progressSpan = 10 } = {}) {
   const watermarkPath = path.join(process.cwd(), "assets", "watermark.png");
