@@ -962,6 +962,9 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
   const introDur = 3;
   const outroDur = 2;
   const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro");
+
+  
+  const targetSec = introDur + (coreDur || 0) + outroDur;
   const totalDur = introDur + (coreDur || 0) + outroDur || null;
 
   const coreHasAudio = await hasAudioStream(corePath);
@@ -974,7 +977,8 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
       `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
       `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
       `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
-      `[v0][v1][v2]concat=n=3:v=1:a=0[v];` +
+      `[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${targetSec},setpts=PTS-STARTPTS[v];
+` +
       `[1:a]adelay=3000|3000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
       `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[bed];` +
       `[bed][voice]amix=inputs=2:duration=first:dropout_transition=2,atrim=duration=${targetSec},asetpts=PTS-STARTPTS[a]
