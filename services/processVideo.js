@@ -441,6 +441,12 @@ async function runFfmpegWithProgress(
       const baseMsg = (message || step).trim();
       const mergedMsg = baseMsg ? `${baseMsg} | ${timeMsg}` : timeMsg;
 
+console.log("[PROGRESS_DB]", {
+  step,
+  progress: global,
+  tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
+});
+
       safeUpdate({ status: "processing", step, progress: global, message: mergedMsg });
 
       setRuntime(jobId, {
@@ -461,6 +467,13 @@ async function runFfmpegWithProgress(
       child.stderr.on("data", (chunk) => {
         bumpActivity();
         const s = chunk.toString();
+
+// DEBUG: confirmer que FFmpeg envoie bien -progress pipe:2 sur stderr
+if (s.includes("out_time_ms=") || s.includes("progress=")) {
+  console.log("[PROGRESS_RAW]", s.trim().split(/\r?\n/).slice(0, 6).join(" | "));
+}
+
+
         stderrAll += s;
 
         if (!totalDurationSec || totalDurationSec <= 0) return;
