@@ -1057,7 +1057,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
     `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
     `-progress pipe:2 ` +
     `-nostats ` +
-    `-stats_period 0.25 ` +
+
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
     `${silenceInput} -filter_complex "${filter}" ` +
     `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
