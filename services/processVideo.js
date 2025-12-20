@@ -305,8 +305,8 @@ async function runFfmpegWithProgress(
     progressBase = 0,
     progressSpan = 100,
     message = "",
-    expectProgress = false, // ✅ progress pipe:2
-    onProgress = null,      // ✅ callback (ex: update repo, ws, etc.)
+    expectProgress = false,   // ✅ progress via -progress pipe:2
+    onProgress = null,        // ✅ callback({ tSec, local, global })
   } = {}
 ) {
   const safeUpdate = (patch) => {
@@ -324,8 +324,13 @@ async function runFfmpegWithProgress(
     return updateVideoJob(jobId, patch).catch((e) => {
       const msg = String(e?.message || e);
 
-      // Erreur typique Supabase cache: "Could not find the 'outTimeSec' column of 'video_jobs' in the schema cache"
-      if (msg.includes("outTimeSec") || msg.includes("'outTimeSec'") || msg.includes("updatedAt") || msg.includes("'updatedAt'")) {
+      // Erreur typique: "Could not find the 'outTimeSec' column of 'video_jobs' in the schema cache"
+      if (
+        msg.includes("outTimeSec") ||
+        msg.includes("'outTimeSec'") ||
+        msg.includes("updatedAt") ||
+        msg.includes("'updatedAt'")
+      ) {
         safeUpdate.__noOutTime = true;
         const { outTimeSec, updatedAt, ...rest } = patch || {};
         return updateVideoJob(jobId, rest).catch((e2) =>
@@ -365,13 +370,13 @@ async function runFfmpegWithProgress(
       return reject(err);
     }
 
+    // Toujours éviter le mode interactif
     if (bin === "ffmpeg" && !args.includes("-nostdin")) {
       args.unshift("-nostdin");
     }
 
-    // Progression machine-readable sur stderr (compatible ffmpeg 4.3.x)
-    // IMPORTANT: pas de -stats_period (non supporté sur ta version)
-    if (bin === "ffmpeg" && !args.includes("-progress")) {
+    // Progression machine-readable sur stderr
+    if (bin === "ffmpeg" && expectProgress && !args.includes("-progress")) {
       const idx = args.indexOf("-nostdin");
       const insertAt = idx >= 0 ? idx + 1 : 0;
       args.splice(insertAt, 0, "-progress", "pipe:2", "-nostats");
@@ -388,7 +393,7 @@ async function runFfmpegWithProgress(
     let lastLocal = -1;
     let lastEmit = 0;
 
-    // buffer + state pour parser -progress pipe:2 de façon robuste (lignes key=value)
+    // buffer + state pour parser -progress pipe:2 (lignes key=value)
     let progressBuf = "";
     let progressState = {};
 
@@ -399,12 +404,8 @@ async function runFfmpegWithProgress(
     };
 
     const cleanup = () => {
-      try {
-        clearTimeout(killTimer);
-      } catch {}
-      try {
-        clearInterval(inactivityTimer);
-      } catch {}
+      try { clearTimeout(killTimer); } catch {}
+      try { clearInterval(inactivityTimer); } catch {}
     };
 
     const finishReject = (err) => {
@@ -422,9 +423,7 @@ async function runFfmpegWithProgress(
     };
 
     const killTimer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
+      try { child.kill("SIGKILL"); } catch {}
       const err = new Error(`Timeout FFmpeg (${label}) after ${FFMPEG_TIMEOUT_MS}ms`);
       safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
       setRuntime(jobId, { step, percent: 100, error: err.message });
@@ -434,9 +433,7 @@ async function runFfmpegWithProgress(
     const inactivityTimer = setInterval(() => {
       const idle = Date.now() - lastActivityAt;
       if (idle < FFMPEG_INACTIVITY_MS) return;
-      try {
-        child.kill("SIGKILL");
-      } catch {}
+      try { child.kill("SIGKILL"); } catch {}
       const err = new Error(`FFmpeg inactive for ${FFMPEG_INACTIVITY_MS}ms (${label})`);
       safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
       setRuntime(jobId, { step, percent: 100, error: err.message });
@@ -446,9 +443,6 @@ async function runFfmpegWithProgress(
     const emitProgress = (tSec) => {
       if (!totalDurationSec || totalDurationSec <= 0) return;
       if (!Number.isFinite(tSec) || tSec < 0) return;
-
-      // borne simple pour ignorer des valeurs aberrantes
-      if (tSec > totalDurationSec * 3) return;
 
       const local = Math.max(0, Math.min(100, Math.round((tSec / totalDurationSec) * 100)));
       const now = Date.now();
@@ -464,37 +458,13 @@ async function runFfmpegWithProgress(
       const baseMsg = (message || step).trim();
       const mergedMsg = baseMsg ? `${baseMsg} | ${timeMsg}` : timeMsg;
 
-      const updatedAt = new Date().toISOString();
-
-      // callback optionnel (ex: mise à jour repo / websocket)
-      if (typeof onProgress === "function") {
-        try {
-          onProgress({
-            jobId,
-            step,
-            progress: global,
-            outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
-            updatedAt,
-            totalDurationSec,
-          });
-        } catch (e) {
-          logJson("⚠️ onProgress failed", { jobId, step, error: String(e?.message || e) });
-        }
-      }
-
-      console.log("[PROGRESS_DB]", {
-        step,
-        progress: global,
-        tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
-      });
-
       safeUpdate({
         status: "processing",
         step,
         progress: global,
         message: mergedMsg,
-        outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
-        updatedAt,
+        outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
+        updatedAt: new Date().toISOString(),
       });
 
       setRuntime(jobId, {
@@ -503,29 +473,32 @@ async function runFfmpegWithProgress(
         outTimeSec: tSec,
         totalSec: totalDurationSec,
       });
+
+      if (typeof onProgress === "function") {
+        try {
+          onProgress({ tSec, local, global, step, totalDurationSec });
+        } catch (e) {
+          logJson("⚠️ onProgress failed", { jobId, step, error: String(e?.message || e) });
+        }
+      }
     };
 
-    if (child.stdout)
+    if (child.stdout) {
       child.stdout.on("data", (c) => {
         bumpActivity();
         stdoutAll += c.toString();
       });
+    }
 
     if (child.stderr) {
       child.stderr.on("data", (chunk) => {
         bumpActivity();
         const s = chunk.toString();
-
-        // DEBUG: confirmer que FFmpeg envoie bien -progress pipe:2 sur stderr
-        if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("progress=")) {
-          console.log("[PROGRESS_RAW]", s.trim().split(/\r?\n/).slice(0, 6).join(" | "));
-        }
-
         stderrAll += s;
 
         if (!totalDurationSec || totalDurationSec <= 0) return;
 
-        // Parser robuste pour -progress pipe:2 (key=value).
+        // Parser robuste pour -progress pipe:2 (key=value). Les morceaux peuvent arriver "coupés"
         if (expectProgress) {
           progressBuf += s;
           const lines = progressBuf.split(/\r?\n/);
@@ -538,39 +511,24 @@ async function runFfmpegWithProgress(
             const v = line.slice(eq + 1).trim();
             progressState[k] = v;
 
-            // out_time_us: microsecondes
             if (k === "out_time_us") {
               const us = Number(v);
               const tSec = us / 1_000_000;
               if (Number.isFinite(tSec)) progressState.__tSec = tSec;
             }
 
-            // out_time_ms: selon les builds, parfois c'est en ms, parfois en us.
             if (k === "out_time_ms") {
               const raw = Number(v);
               let tSec = NaN;
-
               if (Number.isFinite(raw)) {
-                // 1) hypothèse "ms"
-                const tMs = raw / 1_000;
-
-                // 2) si la valeur "ms" dépasse largement la durée totale, c'est sûrement des microsecondes
-                // Exemple observé: 0.874s => out_time_ms=874667 (qui est en réalité us)
-                if (tMs > totalDurationSec * 2) {
-                  tSec = raw / 1_000_000; // traiter comme us
-                } else if (raw >= 10_000_000) {
-                  tSec = raw / 1_000_000; // très grande => us quasi certain
-                } else {
-                  tSec = tMs; // ms normal
-                }
+                if (raw >= 10_000_000) tSec = raw / 1_000_000;
+                else tSec = raw / 1_000;
               }
-
               if (Number.isFinite(tSec)) progressState.__tSec = tSec;
             }
 
-            // On commit surtout quand ffmpeg annonce progress=continue/end
             if (k === "progress" && (v === "continue" || v === "end")) {
-              const tSec = progressState.__tSec;
+              const tSec = Number(progressState.__tSec);
               if (Number.isFinite(tSec)) emitProgress(tSec);
               progressState = {};
             }
@@ -578,7 +536,6 @@ async function runFfmpegWithProgress(
           return;
         }
 
-        // Fallback: parsing regex sur les chunks (mode sans -progress)
         const outMatches = s.match(/out_time=([0-9:.]+)/g);
         if (outMatches?.length) {
           const last = outMatches[outMatches.length - 1].replace("out_time=", "").trim();
@@ -598,7 +555,7 @@ async function runFfmpegWithProgress(
 
     child.on("error", (err) => {
       const msg = err?.message || "ffmpeg error";
-      safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
+      safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg, updatedAt: new Date().toISOString() });
       setRuntime(jobId, { step, percent: 100, error: msg });
       finishReject(err);
     });
@@ -611,6 +568,7 @@ async function runFfmpegWithProgress(
           progress: Math.max(0, Math.min(100, progressBase + progressSpan)),
           message: message || step,
           error: null,
+          updatedAt: new Date().toISOString(),
         });
         setRuntime(jobId, { step, percent: Math.max(0, Math.min(100, progressBase + progressSpan)) });
         return finishResolve({ stdout: stdoutAll, stderr: stderrAll });
@@ -618,27 +576,11 @@ async function runFfmpegWithProgress(
 
       const tail = String(stderrAll || stdoutAll).slice(-4000);
       const msg = `Erreur FFmpeg (${label}) code=${code}: ${tail}`;
-      safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
+      safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg, updatedAt: new Date().toISOString() });
       setRuntime(jobId, { step, percent: 100, error: msg });
       finishReject(new Error(msg));
     });
   });
-}
-
-
-// ------------------------------------------------------
-// ffprobe summary
-// ------------------------------------------------------
-function parseRationalToNumber(val) {
-  if (!val || typeof val !== "string") return null;
-  const parts = val.split("/");
-  if (parts.length !== 2) return null;
-  const n = Number(parts[0]);
-  const d = Number(parts[1]);
-  if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0) return null;
-  if (n === 0) return null;
-  const out = n / d;
-  return Number.isFinite(out) ? out : null;
 }
 
 function summarizeProbeStreams(streams = []) {
@@ -971,6 +913,7 @@ async function normalizeVideo(
   const { stderr } = await runFfmpegWithProgress(cmd, {
     jobId,
     step: `normalize_${globalIndex ?? "x"}`,
+    expectProgress: true,
     label,
     totalDurationSec: capSec, // ✅ basé sur la borne, pas sur dur
     progressBase,
