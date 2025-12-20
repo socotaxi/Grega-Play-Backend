@@ -2,11 +2,18 @@
 import { spawn } from "child_process";
 
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
+const DEFAULT_INACTIVITY_MS = 90 * 1000; // 90s (watchdog)
 
 function getTimeoutMs() {
   const raw = process.env.FFMPEG_TIMEOUT_MS;
   const n = raw ? Number(raw) : NaN;
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
+}
+
+function getInactivityMs() {
+  const raw = process.env.FFMPEG_INACTIVITY_MS;
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_INACTIVITY_MS;
 }
 
 function tail(str, max = 6000) {
@@ -17,11 +24,15 @@ function tail(str, max = 6000) {
 
 /**
  * Exécute une commande FFmpeg sous forme de string via spawn(shell:true),
- * avec logs streamés + timeout hard + kill (incl. process group sur Linux/Railway).
+ * avec logs streamés + timeout hard + kill (incl. process group sur Linux/Railway)
+ * + watchdog d'inactivité (si aucun output pendant FFMPEG_INACTIVITY_MS).
+ *
+ * IMPORTANT: compatible avec l'existant (cmd string).
  */
 function runCmdWithTimeout(cmd, label) {
   return new Promise((resolve, reject) => {
     const timeoutMs = getTimeoutMs();
+    const inactivityMs = getInactivityMs();
 
     // detached sur Linux => permet de tuer tout le groupe (-pid)
     const useDetached = process.platform !== "win32";
@@ -34,6 +45,11 @@ function runCmdWithTimeout(cmd, label) {
 
     let stdoutBuf = "";
     let stderrBuf = "";
+
+    let lastActivityAt = Date.now();
+    const bump = () => {
+      lastActivityAt = Date.now();
+    };
 
     const killAll = () => {
       try {
@@ -60,22 +76,39 @@ function runCmdWithTimeout(cmd, label) {
       reject(err);
     }, timeoutMs);
 
+    const inactivityTimer = setInterval(() => {
+      const idle = Date.now() - lastActivityAt;
+      if (idle < inactivityMs) return;
+      killAll();
+      const err = new Error(
+        `FFmpeg inactive (${label}) après ${Math.round(inactivityMs / 1000)}s`
+      );
+      err.label = label;
+      err.cmd = cmd;
+      err.stderr_tail = tail(stderrBuf);
+      err.stdout_tail = tail(stdoutBuf);
+      clearTimeout(timer);
+      clearInterval(inactivityTimer);
+      reject(err);
+    }, 5000);
+
     child.stdout?.on("data", (d) => {
+      bump();
       const s = d.toString();
       stdoutBuf += s;
-      // logs légers
       // console.log(s.trimEnd());
     });
 
     child.stderr?.on("data", (d) => {
+      bump();
       const s = d.toString();
       stderrBuf += s;
-      // FFmpeg écrit principalement sur stderr
       // console.log(s.trimEnd());
     });
 
     child.on("error", (error) => {
       clearTimeout(timer);
+      clearInterval(inactivityTimer);
       killAll();
       const err = new Error(error?.message || `Erreur FFmpeg (${label})`);
       err.label = label;
@@ -87,6 +120,7 @@ function runCmdWithTimeout(cmd, label) {
 
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      clearInterval(inactivityTimer);
 
       if (code === 0) {
         return resolve({ stdout: stdoutBuf, stderr: stderrBuf });
@@ -126,8 +160,6 @@ export async function runFfmpegPlan(plan) {
     }
 
     console.log(`➡️ [FFmpeg] ${name}`);
-    // console.log(cmd); // décommente si besoin
-
     await runCmdWithTimeout(cmd, name);
 
     if (step.outputPath) {

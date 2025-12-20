@@ -3,6 +3,11 @@
 // FIX CRITIQUE: premium-assets peut être privé => ne pas utiliser getPublicUrl().
 // FIX TRANSITIONS: support des clés UI/schema (modern_1..modern_5) + noms xfade directs.
 // FIX BUG: "capabilities is not defined" (watermarkEnabled devait venir du preset, pas d'une variable inexistante)
+// ✅ PATCH (2025-12-20): normalize anti-hang
+// - débride threads (FFMPEG_THREADS, défaut 0)
+// - preset configurable pour normalize (NORMALIZE_PRESET, défaut ultrafast sur Railway)
+// - borne durée d'input avec -t (MAX_CLIP_SEC, défaut 35s) même si ffprobe est invalide
+// - log durées input pour diagnostic
 
 import path from "path";
 import fs from "fs";
@@ -337,15 +342,12 @@ async function runFfmpegWithProgress(
       return reject(err);
     }
 
-    // Garde-fou: éviter un hang si ffmpeg attend stdin en environnement non-interactif
     if (bin === "ffmpeg" && !args.includes("-nostdin")) {
       args.unshift("-nostdin");
     }
 
-    // ✅ Patch: progression fiable (machine-readable) via -progress pipe:2 (sur stderr) + -nostats
-    // (ne pas ajouter si déjà présent)
+    // Progression machine-readable sur stderr
     if (bin === "ffmpeg" && !args.includes("-progress")) {
-      // Placer tôt dans la commande (après -nostdin si présent)
       const idx = args.indexOf("-nostdin");
       const insertAt = idx >= 0 ? idx + 1 : 0;
       args.splice(insertAt, 0, "-progress", "pipe:2", "-nostats");
@@ -362,7 +364,7 @@ async function runFfmpegWithProgress(
     let lastLocal = -1;
     let lastEmit = 0;
 
-    // ✅ Patch: watchdog d'inactivité (si aucun output pendant FFMPEG_INACTIVITY_MS, on kill)
+    // watchdog d'inactivité
     let lastActivityAt = Date.now();
     const bumpActivity = () => {
       lastActivityAt = Date.now();
@@ -444,16 +446,12 @@ async function runFfmpegWithProgress(
 
     if (child.stderr) {
       child.stderr.on("data", (chunk) => {
-        // ✅ IMPORTANT: en mode -progress pipe:2, FFmpeg écrit surtout sur stderr
         bumpActivity();
-
         const s = chunk.toString();
         stderrAll += s;
 
-        // Si on n'a pas de durée totale, on ne calcule pas de % mais on maintient l'activité.
         if (!totalDurationSec || totalDurationSec <= 0) return;
 
-        // 1) Format -progress: out_time_ms=12345678 (microsecondes)
         const msMatches = s.match(/out_time_ms=(\d+)/g);
         if (msMatches?.length) {
           const last = msMatches[msMatches.length - 1].replace("out_time_ms=", "");
@@ -462,7 +460,6 @@ async function runFfmpegWithProgress(
           return;
         }
 
-        // 2) Format -progress: out_time=HH:MM:SS.xx
         const outMatches = s.match(/out_time=([0-9:.]+)/g);
         if (outMatches?.length) {
           const last = outMatches[outMatches.length - 1].replace("out_time=", "").trim();
@@ -471,7 +468,6 @@ async function runFfmpegWithProgress(
           return;
         }
 
-        // 3) Fallback format classique: time=HH:MM:SS.xx (si -progress absent ou si ffmpeg le sort quand même)
         const timeMatches = s.match(/time=\s*([0-9:.]+)/g);
         if (timeMatches?.length) {
           const last = timeMatches[timeMatches.length - 1].replace("time=", "").trim();
@@ -598,10 +594,28 @@ async function getVideoDuration(inputPath) {
   const { stdout, stderr } = await runCmd(cmd, { label: "getVideoDuration(ffprobe)" });
   const duration = parseFloat(String(stdout || "").trim());
   if (!Number.isFinite(duration)) {
-    logJson("❌ ffprobe(duration) invalid", { inputPath, stdout: String(stdout || "").slice(-400), stderr: String(stderr || "").slice(-400) });
+    logJson("❌ ffprobe(duration) invalid", {
+      inputPath,
+      stdout: String(stdout || "").slice(-400),
+      stderr: String(stderr || "").slice(-400),
+    });
     throw new Error("Durée vidéo invalide");
   }
   return duration;
+}
+
+// ✅ Safe duration (ne throw pas) + log
+async function getVideoDurationSafe(inputPath, label = "duration") {
+  try {
+    const d = await getVideoDuration(inputPath);
+    if (Number.isFinite(d)) {
+      logJson("⏱️ DURATION", { label, inputPath, durationSec: Number(d.toFixed(3)) });
+      return d;
+    }
+  } catch (e) {
+    logJson("⚠️ DURATION_FAILED", { label, inputPath, error: String(e?.message || e) });
+  }
+  return null;
 }
 
 // ------------------------------------------------------
@@ -748,11 +762,31 @@ async function resolveMusicPath(musicPreset, tempDir) {
 // ------------------------------------------------------
 // Normalisation robuste
 // ------------------------------------------------------
+function getNormalizeThreads() {
+  const raw = process.env.FFMPEG_THREADS;
+  const n = raw ? Number(raw) : NaN;
+  // 0 = auto
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function getMaxClipSec() {
+  const raw = process.env.MAX_CLIP_SEC;
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 35;
+}
+
+function getNormalizePreset(isRailway) {
+  const raw = String(process.env.NORMALIZE_PRESET || "").trim();
+  if (raw) return raw;
+  // par défaut: le plus rapide en prod Railway, tout en restant correct
+  return isRailway ? "ultrafast" : "veryfast";
+}
+
 async function normalizeVideo(
   inputPath,
   outputPath,
   fps = 30,
-  { jobId = null, progressBase = 0, progressSpan = 35, label = "normalize", globalIndex = null } = {}
+  { jobId = null, progressBase = 0, progressSpan = 35, label = "normalize", globalIndex = null, isRailway = false } = {}
 ) {
   const inputHasAudio = await hasAudioStream(inputPath);
 
@@ -768,43 +802,66 @@ async function normalizeVideo(
     `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,` +
     `aresample=48000`;
 
+  // ✅ Durée + borne anti-hang
+  const maxClip = getMaxClipSec();
+  const dur = await getVideoDurationSafe(inputPath, `input_${globalIndex ?? "x"}`);
+  const capSec = Number.isFinite(dur) ? Math.min(dur + 0.5, maxClip) : maxClip;
+
+  // ✅ Threads + preset
+  const threads = getNormalizeThreads();
+  const preset = getNormalizePreset(isRailway);
+
   let cmd = "";
   if (inputHasAudio) {
-    // ✅ normalize: -nostdin -threads 1
     cmd =
-      `ffmpeg -nostdin -threads 1 -y -fflags +genpts -i "${inputPath}" ` +
+      `ffmpeg -nostdin -threads ${threads} -y -fflags +genpts -t ${capSec} -i "${inputPath}" ` +
       `-filter_complex "[0:v]${vFilter}[v];[0:a]${aFilter}[a]" ` +
       `-map "[v]" -map "[a]" ` +
-      `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
+      `-c:v libx264 -preset ${preset} -crf 23 -pix_fmt yuv420p ` +
       `-c:a aac -b:a 128k "${outputPath}"`;
   } else {
-    // ✅ normalize: -nostdin -threads 1
     cmd =
-      `ffmpeg -nostdin -threads 1 -y -fflags +genpts -i "${inputPath}" ` +
+      `ffmpeg -nostdin -threads ${threads} -y -fflags +genpts -t ${capSec} -i "${inputPath}" ` +
       `-f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000" ` +
       `-filter_complex "[0:v]${vFilter}[v];[1:a]${aFilter}[a]" ` +
       `-map "[v]" -map "[a]" -shortest ` +
-      `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
+      `-c:v libx264 -preset ${preset} -crf 23 -pix_fmt yuv420p ` +
       `-c:a aac -b:a 128k "${outputPath}"`;
   }
 
-  const dur = await getVideoDuration(inputPath).catch(() => null);
+  logJson("🧪 NORMALIZE_PARAMS", {
+    index: globalIndex,
+    inputPath,
+    outputPath,
+    inputHasAudio,
+    durationSec: dur,
+    capSec,
+    threads,
+    preset,
+    maxClipSec: maxClip,
+    isRailway,
+  });
 
   console.log("➡️ FFmpeg normalize:", cmd);
+
   const { stderr } = await runFfmpegWithProgress(cmd, {
     jobId,
     step: `normalize_${globalIndex ?? "x"}`,
     label,
-    totalDurationSec: dur,
+    totalDurationSec: Number.isFinite(dur) ? dur : null, // si dur invalide, pas de % (mais watchdog/progress continue)
     progressBase,
     progressSpan,
     message: "Normalisation en cours...",
   });
+
   if (stderr) console.log("ℹ️ normalize stderr(tail):", String(stderr).slice(-1200));
 
   logJson("✅ Vidéo normalisée", { index: globalIndex, outputPath });
   const out = await probeStreamsSummary(outputPath, { label: `normalized_${globalIndex ?? "x"}` });
   logJson("🧾 STREAMS(normalized)", { index: globalIndex, outputPath, streams: out });
+
+  // Log durée normalized (utile pour offsets concat)
+  await getVideoDurationSafe(outputPath, `normalized_${globalIndex ?? "x"}`);
 }
 
 // ------------------------------------------------------
@@ -899,7 +956,7 @@ async function runFFmpegFilterConcat(
 async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, { jobId, progressBase = 60, progressSpan = 25 } = {}) {
   const introDur = 3;
   const outroDur = 2;
-  const coreDur = await getVideoDuration(corePath).catch(() => null);
+  const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro");
   const totalDur = introDur + (coreDur || 0) + outroDur || null;
 
   const coreHasAudio = await hasAudioStream(corePath);
@@ -954,7 +1011,7 @@ async function addIntroOutroWithMusic(
 ) {
   const introDur = 3;
   const outroDur = 2;
-  const coreDur = await getVideoDuration(corePath).catch(() => null);
+  const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro_music");
   const totalDur = introDur + (coreDur || 0) + outroDur || null;
 
   const coreHasAudio = await hasAudioStream(corePath);
@@ -1020,7 +1077,7 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
     return;
   }
 
-  const dur = await getVideoDuration(inputPath).catch(() => null);
+  const dur = await getVideoDurationSafe(inputPath, "watermark_input");
 
   const filterComplex = `[1:v]scale=150:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto[v]`;
 
@@ -1139,7 +1196,6 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     const processedPaths = [];
 
-    // ✅ Patch: limiter la concurrence sur Railway (CPU bridé) pour éviter les stalls/temps infinis
     const IS_RAILWAY = Boolean(
       process.env.RAILWAY_ENVIRONMENT ||
         process.env.RAILWAY_PROJECT_ID ||
@@ -1176,6 +1232,7 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
             progressSpan: span,
             label: `normalize_${globalIndex}`,
             globalIndex,
+            isRailway: IS_RAILWAY,
           });
 
           processedPaths[globalIndex] = normalizedPath;
