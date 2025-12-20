@@ -311,9 +311,30 @@ async function runFfmpegWithProgress(
 ) {
   const safeUpdate = (patch) => {
     if (!jobId) return;
-    updateVideoJob(jobId, patch).catch((e) =>
-      logJson("⚠️ updateVideoJob failed", { jobId, step, error: String(e?.message || e) })
-    );
+
+    // Certains environnements (ou schémas) n'ont pas encore les colonnes outTimeSec/updatedAt.
+    // On tente d'abord "plein", puis on désactive proprement si Supabase renvoie une erreur.
+    if (safeUpdate.__noOutTime === true) {
+      const { outTimeSec, updatedAt, ...rest } = patch || {};
+      return updateVideoJob(jobId, rest).catch((e) =>
+        logJson("⚠️ updateVideoJob failed", { jobId, step, error: String(e?.message || e) })
+      );
+    }
+
+    return updateVideoJob(jobId, patch).catch((e) => {
+      const msg = String(e?.message || e);
+
+      // Erreur typique: "Could not find the 'outTimeSec' column of 'video_jobs' in the schema cache"
+      if (msg.includes("outTimeSec") || msg.includes("'outTimeSec'")) {
+        safeUpdate.__noOutTime = true;
+        const { outTimeSec, updatedAt, ...rest } = patch || {};
+        return updateVideoJob(jobId, rest).catch((e2) =>
+          logJson("⚠️ updateVideoJob failed", { jobId, step, error: String(e2?.message || e2) })
+        );
+      }
+
+      logJson("⚠️ updateVideoJob failed", { jobId, step, error: msg });
+    });
   };
 
   safeUpdate({
@@ -353,16 +374,6 @@ async function runFfmpegWithProgress(
       const idx = args.indexOf("-nostdin");
       const insertAt = idx >= 0 ? idx + 1 : 0;
       args.splice(insertAt, 0, "-progress", "pipe:2", "-nostats");
-    }
-
-    // ⚠️ Compat: certaines versions (ex: FFmpeg 4.3.x sur Debian/Railway) n'acceptent pas -stats_period.
-    // Si une ancienne version de ton code (ou un cache) l'injecte, on le neutralise ici pour éviter un crash.
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-stats_period") {
-        const removed = args.splice(i, 2);
-        console.warn("⚠️ FFmpeg option supprimée (non supportée):", removed.join(" "));
-        i = Math.max(-1, i - 1);
-      }
     }
 
     const child = spawn(bin, args, {
@@ -457,15 +468,7 @@ console.log("[PROGRESS_DB]", {
   tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
 });
 
-      safeUpdate({ status: "processing", step, progress: global, message: mergedMsg, outTimeSec: tSec, updatedAt: new Date().toISOString() });
-
-      if (typeof onProgress === "function") {
-        try {
-          onProgress({ step, progress: global, outTimeSec: tSec, totalSec: totalDurationSec });
-        } catch (e) {
-          console.warn("⚠️ onProgress error:", e?.message || e);
-        }
-      }
+      safeUpdate({ status: "processing", step, progress: global, message: mergedMsg });
 
       setRuntime(jobId, {
         step,
@@ -520,8 +523,17 @@ if (k === "out_time_us") {
 }
 
 if (k === "out_time_ms") {
-  const ms = Number(v);
-  const tSec = ms / 1000;
+  const raw = Number(v);
+
+  // ⚠️ Selon les builds FFmpeg, on observe parfois out_time_ms qui a en réalité une valeur en microsecondes.
+  // Heuristique simple : si la valeur est très grande, on la traite comme des microsecondes.
+  // Exemple: 27s => 27093333 (us) au lieu de 27093 (ms).
+  let tSec = NaN;
+  if (Number.isFinite(raw)) {
+    if (raw >= 10_000_000) tSec = raw / 1_000_000; // probablement microsecondes
+    else tSec = raw / 1_000; // millisecondes normales
+  }
+
   if (Number.isFinite(tSec)) progressState.__tSec = tSec;
 }
 
@@ -981,7 +993,7 @@ async function runFFmpegFilterConcat(
   let acc = 0;
   for (let i = 0; i < n - 1; i++) {
     acc += Number(durations[i]) || 0;
-    offsets.push(Number(Math.max(0, acc - transitionDuration * (i + 1)).toFixed(3)));
+    offsets.push(Math.max(0, acc - transitionDuration * (i + 1)));
   }
 
   logJson("🧩 CONCAT_DEBUG", { durations, transition, transitionDuration, offsets });
@@ -1021,9 +1033,7 @@ async function runFFmpegFilterConcat(
     `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
     `-c:a aac -b:a 128k "${outputPath}"`;
 
-  const totalRaw = (durations || []).reduce((a, b) => a + (Number(b) || 0), 0);
-  // Durée réelle de sortie avec xfade: somme - (transitionDuration * (n-1))
-  const total = Math.max(0, totalRaw - (transitionDuration || 0) * Math.max(0, n - 1));
+  const total = (durations || []).reduce((a, b) => a + (Number(b) || 0), 0);
 
   console.log("➡️ FFmpeg concat+xfade:", cmd);
   await runFfmpegWithProgress(cmd, {
@@ -1075,9 +1085,6 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
 
   const cmd =
     `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
-    `-progress pipe:2 ` +
-    `-nostats ` +
-
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
     `${silenceInput} -filter_complex "${filter}" ` +
     `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
