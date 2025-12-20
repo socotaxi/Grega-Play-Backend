@@ -1052,6 +1052,8 @@ async function addIntroOutroWithMusic(
 
   const cmd =
     `ffmpeg -nostdin -y ` +
+    `-progress pipe:2 ` +
+    `-nostats ` +
     `-loop 1 -t ${introDur} -i "${introPath}" ` +
     `-i "${corePath}" ` +
     `-loop 1 -t ${outroDur} -i "${outroPath}" ` +
