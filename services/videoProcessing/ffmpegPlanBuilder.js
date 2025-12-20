@@ -29,6 +29,11 @@ function escForFilter(str) {
  *
  * inputs: clipsPaths[], durations[]
  * assets: { introPath, outroPath, musicPath, watermarkPath, textIntroPng?, textOutroPng? }
+ *
+ * PATCH Option A:
+ * - Ajout de expectProgress: true sur les étapes "longues"
+ * - Ajout de "-progress pipe:2 -nostats" dans les cmd des étapes suivies
+ *   (le parser est dans ffmpegRunner.js)
  */
 export function buildFfmpegPlan({
   clipsPaths,
@@ -58,13 +63,18 @@ export function buildFfmpegPlan({
   // Step 1: concat + transitions
   // -------------------------
   if (clipsPaths.length === 1) {
-    const cmdSingle = `ffmpeg -y -i "${clipsPaths[0]}" \
+    const cmdSingle = `ffmpeg -nostdin -y -progress pipe:2 -nostats -i "${clipsPaths[0]}" \
 -c:v libx264 -preset veryfast -crf 26 \
 -c:a aac -b:a 96k -ar 44100 \
 -movflags +faststart \
 "${outConcat}"`;
 
-    steps.push({ name: "concat_single", cmd: cmdSingle, outputPath: outConcat });
+    steps.push({
+      name: "concat_single",
+      cmd: cmdSingle,
+      outputPath: outConcat,
+      expectProgress: true,
+    });
   } else {
     // offsets for xfade
     const offsets = [];
@@ -99,10 +109,10 @@ export function buildFfmpegPlan({
       const offset = offsets[i - 1];
 
       parts.push(
-        `${vPrev}${vCur} xfade=transition=${transition}:duration=${transDuration}:offset=${offset} ${vOut}`
+        `${vPrev}${vCur}xfade=transition=${transition}:duration=${transDuration}:offset=${offset}${vOut}`
       );
       parts.push(
-        `${aPrev}${aCur} acrossfade=d=${transDuration}:c1=tri:c2=tri ${aOut}`
+        `${aPrev}${aCur}acrossfade=d=${transDuration}:c1=tri:c2=tri${aOut}`
       );
 
       vPrev = vOut;
@@ -110,7 +120,7 @@ export function buildFfmpegPlan({
     }
 
     const filterComplex = parts.join("; ");
-    const cmd = `ffmpeg -y ${inputs} \
+    const cmd = `ffmpeg -nostdin -y -progress pipe:2 -nostats ${inputs} \
 -filter_complex "${filterComplex}" \
 -map "${vPrev}" -map "${aPrev}" \
 -c:v libx264 -preset veryfast -crf 26 \
@@ -119,7 +129,12 @@ export function buildFfmpegPlan({
 -threads 2 \
 "${outConcat}"`;
 
-    steps.push({ name: "concat_transitions", cmd, outputPath: outConcat });
+    steps.push({
+      name: "concat_transitions",
+      cmd,
+      outputPath: outConcat,
+      expectProgress: true,
+    });
   }
 
   // -------------------------
@@ -137,19 +152,21 @@ export function buildFfmpegPlan({
 
   // si intro/outro absents → on copie juste
   if (!introEnabled && !outroEnabled) {
-    const cmdCopy = `ffmpeg -y -i "${outConcat}" -c copy "${outIntroOutro}"`;
+    const cmdCopy = `ffmpeg -nostdin -y -i "${outConcat}" -c copy "${outIntroOutro}"`;
     steps.push({
       name: "copy_no_intro_outro",
       cmd: cmdCopy,
       outputPath: outIntroOutro,
+      expectProgress: false,
     });
   } else if (!introPath || !outroPath) {
     // fallback: juste copy
-    const cmdCopy = `ffmpeg -y -i "${outConcat}" -c copy "${outIntroOutro}"`;
+    const cmdCopy = `ffmpeg -nostdin -y -i "${outConcat}" -c copy "${outIntroOutro}"`;
     steps.push({
       name: "copy_missing_intro_outro_assets",
       cmd: cmdCopy,
       outputPath: outIntroOutro,
+      expectProgress: false,
     });
   } else {
     const introDur = 3;
@@ -157,14 +174,14 @@ export function buildFfmpegPlan({
 
     if (!musicPath || musicMode === "none" || musicMode === "full") {
       // sans musique ici (full sera géré après)
-      const cmdNoMusic = `ffmpeg -y \
+      const cmdNoMusic = `ffmpeg -nostdin -y -progress pipe:2 -nostats \
 -loop 1 -t ${introDur} -i "${introPath}" \
 -i "${outConcat}" \
 -loop 1 -t ${outroDur} -i "${outroPath}" \
 -filter_complex "\
-[0:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v0]; \
-[1:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v1]; \
-[2:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v2]; \
+[0:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16,format=yuv420p[v0]; \
+[1:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16,format=yuv420p[v1]; \
+[2:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16,format=yuv420p[v2]; \
 [v0][v1][v2]concat=n=3:v=1:a=0[v]; \
 [1:a]adelay=${introDur * 1000}|${introDur * 1000}[voice]" \
 -map "[v]" -map "[voice]" \
@@ -177,6 +194,7 @@ export function buildFfmpegPlan({
         name: "intro_outro_no_music",
         cmd: cmdNoMusic,
         outputPath: outIntroOutro,
+        expectProgress: true,
       });
     } else {
       // musique intro_outro (bornée pour éviter durée énorme/infinie)
@@ -192,15 +210,15 @@ export function buildFfmpegPlan({
       // L'outro music démarre à la fin du core (après l'intro vidéo)
       const outroStartMs = Math.round((introDur + coreDurApprox) * 1000);
 
-      const cmdMusic = `ffmpeg -y \
+      const cmdMusic = `ffmpeg -nostdin -y -progress pipe:2 -nostats \
 -loop 1 -t ${introDur} -i "${introPath}" \
 -i "${outConcat}" \
 -loop 1 -t ${outroDur} -i "${outroPath}" \
 -i "${musicPath}" \
 -filter_complex "\
-[0:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v0]; \
-[1:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v1]; \
-[2:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16[v2]; \
+[0:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16,format=yuv420p[v0]; \
+[1:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16,format=yuv420p[v1]; \
+[2:v]scale=720:1280:force_original_aspect_ratio=decrease,setsar=1:1,setdar=9/16,format=yuv420p[v2]; \
 [v0][v1][v2]concat=n=3:v=1:a=0[v]; \
 [1:a]adelay=${introDur * 1000}|${introDur * 1000}[voice]; \
 [3:a]atrim=0:${introDur},asetpts=PTS-STARTPTS,volume=${volume}[m_intro]; \
@@ -218,6 +236,7 @@ export function buildFfmpegPlan({
         name: "intro_outro_music_intro_outro",
         cmd: cmdMusic,
         outputPath: outIntroOutro,
+        expectProgress: true,
       });
     }
   }
@@ -227,7 +246,7 @@ export function buildFfmpegPlan({
   // -------------------------
   if (musicMode === "full" && musicPath) {
     const volume = Math.max(0.05, Math.min(1, musicVolume));
-    const cmdFull = `ffmpeg -y -i "${outIntroOutro}" -stream_loop -1 -i "${musicPath}" \
+    const cmdFull = `ffmpeg -nostdin -y -progress pipe:2 -nostats -i "${outIntroOutro}" -stream_loop -1 -i "${musicPath}" \
 -filter_complex "[1:a]volume=${volume}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]" \
 -map 0:v -map "[a]" \
 -c:v copy \
@@ -235,11 +254,21 @@ export function buildFfmpegPlan({
 -movflags +faststart \
 "${outMusicFull}"`;
 
-    steps.push({ name: "music_full", cmd: cmdFull, outputPath: outMusicFull });
+    steps.push({
+      name: "music_full",
+      cmd: cmdFull,
+      outputPath: outMusicFull,
+      expectProgress: true,
+    });
   } else {
     // copy forward
-    const cmdCopy = `ffmpeg -y -i "${outIntroOutro}" -c copy "${outMusicFull}"`;
-    steps.push({ name: "copy_no_full_music", cmd: cmdCopy, outputPath: outMusicFull });
+    const cmdCopy = `ffmpeg -nostdin -y -i "${outIntroOutro}" -c copy "${outMusicFull}"`;
+    steps.push({
+      name: "copy_no_full_music",
+      cmd: cmdCopy,
+      outputPath: outMusicFull,
+      expectProgress: false,
+    });
   }
 
   // -------------------------
@@ -247,17 +276,27 @@ export function buildFfmpegPlan({
   // -------------------------
   const watermarkPath = assets?.watermarkPath;
   if (watermarkPath) {
-    const cmdWm = `ffmpeg -y -i "${outMusicFull}" -i "${watermarkPath}" \
+    const cmdWm = `ffmpeg -nostdin -y -progress pipe:2 -nostats -i "${outMusicFull}" -i "${watermarkPath}" \
 -filter_complex "overlay=W-w-20:H-h-20" \
 -c:v libx264 -preset veryfast -crf 26 \
 -c:a copy \
 -movflags +faststart \
 "${outWatermark}"`;
 
-    steps.push({ name: "watermark", cmd: cmdWm, outputPath: outWatermark });
+    steps.push({
+      name: "watermark",
+      cmd: cmdWm,
+      outputPath: outWatermark,
+      expectProgress: true,
+    });
   } else {
-    const cmdCopy = `ffmpeg -y -i "${outMusicFull}" -c copy "${outWatermark}"`;
-    steps.push({ name: "copy_no_watermark", cmd: cmdCopy, outputPath: outWatermark });
+    const cmdCopy = `ffmpeg -nostdin -y -i "${outMusicFull}" -c copy "${outWatermark}"`;
+    steps.push({
+      name: "copy_no_watermark",
+      cmd: cmdCopy,
+      outputPath: outWatermark,
+      expectProgress: false,
+    });
   }
 
   return {

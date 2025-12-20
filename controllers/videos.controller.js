@@ -786,6 +786,7 @@ export async function getJobStatus(req, res) {
       eventId: safeJob.event_id,
       userId: safeJob.user_id,
       status: safeJob.status,
+      message: safeJob.message || null,
       progress: mergedProgress,
       step: runtime?.step || safeJob.step || null,
       ffmpeg: runtime

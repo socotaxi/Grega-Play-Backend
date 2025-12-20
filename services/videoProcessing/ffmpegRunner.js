@@ -4,6 +4,10 @@ import { spawn } from "child_process";
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
 const DEFAULT_INACTIVITY_MS = 90 * 1000; // 90s (watchdog)
 
+// Throttle pour éviter d'inonder la DB côté caller.
+// (Option A: pas de colonne DB supplémentaire => on pousse un patch stable: outTimeSec + progress + updatedAt)
+const DEFAULT_PROGRESS_THROTTLE_MS = 1200;
+
 function getTimeoutMs() {
   const raw = process.env.FFMPEG_TIMEOUT_MS;
   const n = raw ? Number(raw) : NaN;
@@ -14,6 +18,12 @@ function getInactivityMs() {
   const raw = process.env.FFMPEG_INACTIVITY_MS;
   const n = raw ? Number(raw) : NaN;
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_INACTIVITY_MS;
+}
+
+function getProgressThrottleMs() {
+  const raw = process.env.FFMPEG_PROGRESS_THROTTLE_MS;
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_PROGRESS_THROTTLE_MS;
 }
 
 function tail(str, max = 6000) {
@@ -30,13 +40,29 @@ function safeNumber(x) {
 /**
  * Parse les lignes de progress FFmpeg (quand -progress pipe:2).
  * Format typique:
- * out_time_ms=123456
+ * out_time_ms=12345678   (⚠️ en réalité ce champ est en MICROsecondes)
  * progress=continue|end
+ *
+ * PATCH Option A:
+ * - On stocke out_time_ms (microsecondes) et on n'émet qu'au moment de "progress=..."
+ * - outTimeSec = out_time_ms / 1e6
+ * - Throttle intégré (pour limiter les callbacks)
  */
-function createProgressParser({ label, onProgress }) {
+function createProgressParser({ label, onProgress, throttleMs }) {
   let leftover = "";
-  let lastOutTimeMs = null;
+
+  // FFmpeg: out_time_ms = microseconds
+  let lastOutTimeUs = null;
+
   let lastProgressEventAt = Date.now();
+
+  // throttle
+  let lastEmitAt = 0;
+  const shouldEmitNow = (now, progressValue) => {
+    if (progressValue === "end") return true; // toujours émettre la fin
+    if (!throttleMs || throttleMs <= 0) return true;
+    return now - lastEmitAt >= throttleMs;
+  };
 
   const emit = (patch) => {
     if (typeof onProgress === "function") {
@@ -50,7 +76,6 @@ function createProgressParser({ label, onProgress }) {
 
   const feed = (chunkStr) => {
     leftover += chunkStr;
-    // Split lignes
     const lines = leftover.split(/\r?\n/);
     leftover = lines.pop() || "";
 
@@ -65,25 +90,37 @@ function createProgressParser({ label, onProgress }) {
       const val = trimmed.slice(idx + 1).trim();
 
       if (key === "out_time_ms") {
-        const ms = safeNumber(val);
-        if (ms !== null) {
-          if (lastOutTimeMs === null || ms !== lastOutTimeMs) {
-            lastOutTimeMs = ms;
-            lastProgressEventAt = Date.now();
-            emit({ outTimeMs: ms, outTimeSec: ms / 1000 });
-          }
+        const us = safeNumber(val);
+        if (us !== null) {
+          lastOutTimeUs = us;
+          lastProgressEventAt = Date.now();
         }
-      } else if (key === "progress") {
-        lastProgressEventAt = Date.now();
-        emit({ progress: val });
+        continue;
+      }
+
+      if (key === "progress") {
+        const now = Date.now();
+        lastProgressEventAt = now;
+
+        const outTimeSec =
+          lastOutTimeUs === null ? null : Math.max(0, lastOutTimeUs / 1_000_000);
+
+        if (shouldEmitNow(now, val)) {
+          lastEmitAt = now;
+          emit({
+            // Option A: payload minimal et stable
+            progress: val, // "continue" | "end"
+            outTimeSec,
+            updatedAt: new Date(now).toISOString(),
+          });
+        }
       }
     }
   };
 
-  const getLastOutTimeMs = () => lastOutTimeMs;
   const getLastProgressEventAt = () => lastProgressEventAt;
 
-  return { feed, getLastOutTimeMs, getLastProgressEventAt };
+  return { feed, getLastProgressEventAt };
 }
 
 /**
@@ -95,7 +132,7 @@ function createProgressParser({ label, onProgress }) {
  * - parse optionnel de out_time_ms / progress=end
  *
  * Options:
- * - onProgress: ({label, outTimeMs, outTimeSec, progress}) => void
+ * - onProgress: ({label, progress, outTimeSec, updatedAt}) => void
  * - expectProgress: true/false (si true, active le watchdog d'avancement)
  */
 export function runCmdWithTimeout(cmd, label, options = {}) {
@@ -103,7 +140,12 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
     const timeoutMs = getTimeoutMs();
     const inactivityMs = getInactivityMs();
 
-    const { onProgress, expectProgress = false } = options;
+    const {
+      onProgress,
+      expectProgress = false,
+    } = options;
+
+    const throttleMs = getProgressThrottleMs();
 
     // detached sur Linux => permet de tuer tout le groupe (-pid)
     const useDetached = process.platform !== "win32";
@@ -122,7 +164,11 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       lastActivityAt = Date.now();
     };
 
-    const progressParser = createProgressParser({ label, onProgress });
+    const progressParser = createProgressParser({
+      label,
+      onProgress,
+      throttleMs,
+    });
 
     const killAll = () => {
       try {
@@ -168,19 +214,19 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       reject(err);
     }, 5000);
 
-    // Watchdog: le progress n'avance plus (out_time_ms identique)
-    // Un vrai “blocage” typique: FFmpeg sort encore du texte, mais out_time_ms reste figé.
+    // Watchdog: le progress ne sort plus (progress=... / out_time_ms...)
     const progressStallTimer = setInterval(() => {
       if (!expectProgress) return;
 
       const lastEventAt = progressParser.getLastProgressEventAt();
       const stalledFor = Date.now() - lastEventAt;
 
-      // Si on n'a eu AUCUN event progress depuis trop longtemps
       if (stalledFor >= inactivityMs) {
         killAll();
         const err = new Error(
-          `FFmpeg stalled progress (${label}) après ${Math.round(inactivityMs / 1000)}s (out_time_ms n'avance plus)`
+          `FFmpeg stalled progress (${label}) après ${Math.round(
+            inactivityMs / 1000
+          )}s (plus de progress=... / out_time_ms)`
         );
         err.label = label;
         err.cmd = cmd;
@@ -197,6 +243,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       bump();
       const s = d.toString();
       stdoutBuf += s;
+
       // Si un jour tu mets -progress pipe:1, on saura le lire aussi
       if (expectProgress) progressParser.feed(s);
     });
@@ -209,7 +256,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       // IMPORTANT: avec -progress pipe:2, les key=value arrivent ici
       if (expectProgress) progressParser.feed(s);
 
-      // tu avais déjà console.log, on garde (utile sur Railway)
+      // utile sur Railway
       console.log(s.trimEnd());
     });
 
@@ -232,7 +279,6 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       clearInterval(progressStallTimer);
 
       if (code === 0) {
-        // Dernier event: si progress=end n'est jamais arrivé, pas grave.
         return resolve({ stdout: stdoutBuf, stderr: stderrBuf });
       }
 
@@ -256,15 +302,17 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
  * Exécute un plan FFmpeg séquentiel.
  * plan = { steps: [{ name, cmd, outputPath, expectProgress? }], outputs: { finalPath } }
  *
- * Compatibilité: si expectProgress absent => false.
- * Hook optionnel global: plan.onProgress(labelPatch)
+ * Hook optionnel global: plan.onProgress(patch)
+ * PATCH Option A:
+ * - On forward (step + label + progress + outTimeSec + updatedAt)
  */
 export async function runFfmpegPlan(plan) {
   if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
     throw new Error("FFmpeg plan invalide (aucune étape).");
   }
 
-  const planOnProgress = typeof plan.onProgress === "function" ? plan.onProgress : null;
+  const planOnProgress =
+    typeof plan.onProgress === "function" ? plan.onProgress : null;
 
   for (const step of plan.steps) {
     const name = step?.name || "step";
