@@ -355,6 +355,16 @@ async function runFfmpegWithProgress(
       args.splice(insertAt, 0, "-progress", "pipe:2", "-nostats");
     }
 
+    // ⚠️ Compat: certaines versions (ex: FFmpeg 4.3.x sur Debian/Railway) n'acceptent pas -stats_period.
+    // Si une ancienne version de ton code (ou un cache) l'injecte, on le neutralise ici pour éviter un crash.
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "-stats_period") {
+        const removed = args.splice(i, 2);
+        console.warn("⚠️ FFmpeg option supprimée (non supportée):", removed.join(" "));
+        i = Math.max(-1, i - 1);
+      }
+    }
+
     const child = spawn(bin, args, {
       shell: false,
       windowsHide: true,
@@ -447,7 +457,15 @@ console.log("[PROGRESS_DB]", {
   tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
 });
 
-      safeUpdate({ status: "processing", step, progress: global, message: mergedMsg });
+      safeUpdate({ status: "processing", step, progress: global, message: mergedMsg, outTimeSec: tSec, updatedAt: new Date().toISOString() });
+
+      if (typeof onProgress === "function") {
+        try {
+          onProgress({ step, progress: global, outTimeSec: tSec, totalSec: totalDurationSec });
+        } catch (e) {
+          console.warn("⚠️ onProgress error:", e?.message || e);
+        }
+      }
 
       setRuntime(jobId, {
         step,
@@ -503,7 +521,7 @@ if (k === "out_time_us") {
 
 if (k === "out_time_ms") {
   const ms = Number(v);
-  const tSec = ms / 1_000_000;
+  const tSec = ms / 1000;
   if (Number.isFinite(tSec)) progressState.__tSec = tSec;
 }
 
@@ -963,7 +981,7 @@ async function runFFmpegFilterConcat(
   let acc = 0;
   for (let i = 0; i < n - 1; i++) {
     acc += Number(durations[i]) || 0;
-    offsets.push(Math.max(0, acc - transitionDuration * (i + 1)));
+    offsets.push(Number(Math.max(0, acc - transitionDuration * (i + 1)).toFixed(3)));
   }
 
   logJson("🧩 CONCAT_DEBUG", { durations, transition, transitionDuration, offsets });
@@ -1003,7 +1021,9 @@ async function runFFmpegFilterConcat(
     `-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p ` +
     `-c:a aac -b:a 128k "${outputPath}"`;
 
-  const total = (durations || []).reduce((a, b) => a + (Number(b) || 0), 0);
+  const totalRaw = (durations || []).reduce((a, b) => a + (Number(b) || 0), 0);
+  // Durée réelle de sortie avec xfade: somme - (transitionDuration * (n-1))
+  const total = Math.max(0, totalRaw - (transitionDuration || 0) * Math.max(0, n - 1));
 
   console.log("➡️ FFmpeg concat+xfade:", cmd);
   await runFfmpegWithProgress(cmd, {
