@@ -503,7 +503,7 @@ if (k === "out_time_us") {
 
 if (k === "out_time_ms") {
   const ms = Number(v);
-  const tSec = ms / 1_000;
+  const tSec = ms / 1_000_000;
   if (Number.isFinite(tSec)) progressState.__tSec = tSec;
 }
 
