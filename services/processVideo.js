@@ -268,7 +268,7 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
     });
 
     child.on("close", (code) => {
-      clearTimeout(killTimer);      
+      clearTimeout(killTimer);
       if (code === 0) return resolve({ stdout, stderr });
       const tail = String(stderr || stdout).slice(-4000);
       reject(new Error(`Erreur cmd (${label}) code=${code}: ${tail}`));
@@ -324,6 +324,8 @@ async function runFfmpegWithProgress(
   });
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+
     const parts = splitCommand(cmd);
     const bin = parts[0];
     const args = parts.slice(1);
@@ -360,6 +362,35 @@ async function runFfmpegWithProgress(
     let lastLocal = -1;
     let lastEmit = 0;
 
+    // ✅ Patch: watchdog d'inactivité (si aucun output pendant FFMPEG_INACTIVITY_MS, on kill)
+    let lastActivityAt = Date.now();
+    const bumpActivity = () => {
+      lastActivityAt = Date.now();
+    };
+
+    const cleanup = () => {
+      try {
+        clearTimeout(killTimer);
+      } catch {}
+      try {
+        clearInterval(inactivityTimer);
+      } catch {}
+    };
+
+    const finishReject = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    const finishResolve = (val) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(val);
+    };
+
     const killTimer = setTimeout(() => {
       try {
         child.kill("SIGKILL");
@@ -367,14 +398,8 @@ async function runFfmpegWithProgress(
       const err = new Error(`Timeout FFmpeg (${label}) after ${FFMPEG_TIMEOUT_MS}ms`);
       safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
       setRuntime(jobId, { step, percent: 100, error: err.message });
-      reject(err);
+      finishReject(err);
     }, FFMPEG_TIMEOUT_MS);
-
-    // ✅ Patch: watchdog d'inactivité (si aucun output pendant FFMPEG_INACTIVITY_MS, on kill)
-    let lastActivityAt = Date.now();
-    const bumpActivity = () => {
-      lastActivityAt = Date.now();
-    };
 
     const inactivityTimer = setInterval(() => {
       const idle = Date.now() - lastActivityAt;
@@ -385,59 +410,85 @@ async function runFfmpegWithProgress(
       const err = new Error(`FFmpeg inactive for ${FFMPEG_INACTIVITY_MS}ms (${label})`);
       safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
       setRuntime(jobId, { step, percent: 100, error: err.message });
-      clearTimeout(killTimer);      
-      reject(err);
+      finishReject(err);
     }, 5000);
+
+    const emitProgress = (tSec) => {
+      if (!totalDurationSec || totalDurationSec <= 0) return;
+      if (!Number.isFinite(tSec) || tSec < 0) return;
+
+      const local = Math.max(0, Math.min(100, Math.round((tSec / totalDurationSec) * 100)));
+      const now = Date.now();
+      if (local === lastLocal) return;
+      if (now - lastEmit < 400 && local < 100) return;
+
+      lastLocal = local;
+      lastEmit = now;
+
+      const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
+      safeUpdate({ status: "processing", step, progress: global, message: message || step });
+
+      setRuntime(jobId, {
+        step,
+        percent: global,
+        outTimeSec: tSec,
+        totalSec: totalDurationSec,
+      });
+    };
 
     if (child.stdout)
       child.stdout.on("data", (c) => {
         bumpActivity();
         stdoutAll += c.toString();
       });
+
     if (child.stderr) {
       child.stderr.on("data", (chunk) => {
+        // ✅ IMPORTANT: en mode -progress pipe:2, FFmpeg écrit surtout sur stderr
+        bumpActivity();
+
         const s = chunk.toString();
         stderrAll += s;
 
+        // Si on n'a pas de durée totale, on ne calcule pas de % mais on maintient l'activité.
         if (!totalDurationSec || totalDurationSec <= 0) return;
 
-        const matches = s.match(/time=\s*([0-9:.]+)/g);
-        if (!matches?.length) return;
+        // 1) Format -progress: out_time_ms=12345678 (microsecondes)
+        const msMatches = s.match(/out_time_ms=(\d+)/g);
+        if (msMatches?.length) {
+          const last = msMatches[msMatches.length - 1].replace("out_time_ms=", "");
+          const tSec = Number(last) / 1_000_000;
+          if (Number.isFinite(tSec)) emitProgress(tSec);
+          return;
+        }
 
-        const last = matches[matches.length - 1].replace("time=", "").trim();
-        const tSec = parseFfmpegTimeToSeconds(last);
-        if (tSec == null) return;
+        // 2) Format -progress: out_time=HH:MM:SS.xx
+        const outMatches = s.match(/out_time=([0-9:.]+)/g);
+        if (outMatches?.length) {
+          const last = outMatches[outMatches.length - 1].replace("out_time=", "").trim();
+          const tSec = parseFfmpegTimeToSeconds(last);
+          if (tSec != null) emitProgress(tSec);
+          return;
+        }
 
-        const local = Math.max(0, Math.min(100, Math.round((tSec / totalDurationSec) * 100)));
-        const now = Date.now();
-        if (local === lastLocal) return;
-        if (now - lastEmit < 400 && local < 100) return;
-
-        lastLocal = local;
-        lastEmit = now;
-
-        const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
-        safeUpdate({ status: "processing", step, progress: global, message: message || step });
-
-        setRuntime(jobId, {
-          step,
-          percent: global,
-          outTimeSec: tSec,
-          totalSec: totalDurationSec,
-        });
+        // 3) Fallback format classique: time=HH:MM:SS.xx (si -progress absent ou si ffmpeg le sort quand même)
+        const timeMatches = s.match(/time=\s*([0-9:.]+)/g);
+        if (timeMatches?.length) {
+          const last = timeMatches[timeMatches.length - 1].replace("time=", "").trim();
+          const tSec = parseFfmpegTimeToSeconds(last);
+          if (tSec != null) emitProgress(tSec);
+        }
       });
     }
 
     child.on("error", (err) => {
-      clearTimeout(killTimer);
       const msg = err?.message || "ffmpeg error";
       safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
       setRuntime(jobId, { step, percent: 100, error: msg });
-      reject(err);
+      finishReject(err);
     });
 
     child.on("close", (code) => {
-      clearTimeout(killTimer);
       if (code === 0) {
         safeUpdate({
           status: "processing",
@@ -447,13 +498,14 @@ async function runFfmpegWithProgress(
           error: null,
         });
         setRuntime(jobId, { step, percent: Math.max(0, Math.min(100, progressBase + progressSpan)) });
-        return resolve({ stdout: stdoutAll, stderr: stderrAll });
+        return finishResolve({ stdout: stdoutAll, stderr: stderrAll });
       }
+
       const tail = String(stderrAll || stdoutAll).slice(-4000);
       const msg = `Erreur FFmpeg (${label}) code=${code}: ${tail}`;
       safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
       setRuntime(jobId, { step, percent: 100, error: msg });
-      reject(new Error(msg));
+      finishReject(new Error(msg));
     });
   });
 }
