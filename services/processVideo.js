@@ -305,6 +305,8 @@ async function runFfmpegWithProgress(
     progressBase = 0,
     progressSpan = 100,
     message = "",
+    expectProgress = false,   // ✅ NEW
+    onProgress = null,        // ✅ NEW
   } = {}
 ) {
   const safeUpdate = (patch) => {
@@ -505,6 +507,25 @@ async function runFfmpegWithProgress(
     });
   });
 }
+
+const emitDbProgress = (p) => {
+  if (typeof onProgress === "function") return onProgress(p);
+
+  // ✅ comportement par défaut: push dans la DB
+  if (!jobId) return;
+
+  updateVideoJob(jobId, {
+    ffmpeg: {
+      step,
+      percent: p.percent,
+      outTimeSec: p.outTimeSec,
+      totalSec: p.totalSec,
+      updatedAt: p.updatedAt,
+      error: null,
+    },
+  }).catch(() => {});
+};
+
 
 // ------------------------------------------------------
 // ffprobe summary
