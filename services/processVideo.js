@@ -790,23 +790,7 @@ async function normalizeVideo(
 ) {
   const inputHasAudio = await hasAudioStream(inputPath);
 
-  const vFilter =
-  `settb=AVTB,` +
-  `fps=${fps},` +
-  `setpts=N/(${fps}*TB),` +
-  `scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `setsar=1,format=yuv420p,` +
-  `trim=duration=${capSec},setpts=PTS-STARTPTS`;
-
-
-  const aFilter =
-  `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,` +
-  `aresample=48000,` +
-  `atrim=duration=${capSec},asetpts=PTS-STARTPTS`;
-
-
-  // ✅ Durée + borne anti-hang
+  // ✅ Durée + borne anti-hang (capSec doit exister AVANT les filtres)
   const maxClip = getMaxClipSec();
   const dur = await getVideoDurationSafe(inputPath, `input_${globalIndex ?? "x"}`);
   const capSec = Number.isFinite(dur) ? Math.min(dur + 0.5, maxClip) : maxClip;
@@ -815,7 +799,23 @@ async function normalizeVideo(
   const threads = getNormalizeThreads();
   const preset = getNormalizePreset(isRailway);
 
+  // ✅ Filtres (utilisent capSec)
+  const vFilter =
+    `settb=AVTB,` +
+    `fps=${fps},` +
+    `setpts=N/(${fps}*TB),` +
+    `scale=720:1280:force_original_aspect_ratio=decrease,` +
+    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
+    `setsar=1,format=yuv420p,` +
+    `trim=duration=${capSec},setpts=PTS-STARTPTS`;
+
+  const aFilter =
+    `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,` +
+    `aresample=48000,` +
+    `atrim=duration=${capSec},asetpts=PTS-STARTPTS`;
+
   let cmd = "";
+
   if (inputHasAudio) {
     cmd =
       `ffmpeg -nostdin -threads ${threads} -y -fflags +genpts -t ${capSec} -i "${inputPath}" ` +
@@ -852,7 +852,7 @@ async function normalizeVideo(
     jobId,
     step: `normalize_${globalIndex ?? "x"}`,
     label,
-    totalDurationSec: Number.isFinite(dur) ? dur : null, // si dur invalide, pas de % (mais watchdog/progress continue)
+    totalDurationSec: capSec, // ✅ basé sur la borne, pas sur dur
     progressBase,
     progressSpan,
     message: "Normalisation en cours...",
@@ -861,12 +861,13 @@ async function normalizeVideo(
   if (stderr) console.log("ℹ️ normalize stderr(tail):", String(stderr).slice(-1200));
 
   logJson("✅ Vidéo normalisée", { index: globalIndex, outputPath });
+
   const out = await probeStreamsSummary(outputPath, { label: `normalized_${globalIndex ?? "x"}` });
   logJson("🧾 STREAMS(normalized)", { index: globalIndex, outputPath, streams: out });
 
-  // Log durée normalized (utile pour offsets concat)
   await getVideoDurationSafe(outputPath, `normalized_${globalIndex ?? "x"}`);
 }
+
 
 // ------------------------------------------------------
 // Concat xfade + acrossfade
