@@ -986,8 +986,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
       `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
       `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
       `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
-      `[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${targetSec},setpts=PTS-STARTPTS[v]
-;` +
+      `[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${targetSec},setpts=PTS-STARTPTS[v];` +
       `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[a]`;
   }
 
@@ -1052,6 +1051,8 @@ async function addIntroOutroWithMusic(
   } else {
     filter += `[bed][music]amix=inputs=2:duration=shortest[a]`;
   }
+
+filter = String(filter || "").replace(/\s*\n\s*/g, " ").trim();
 
   const cmd =
     `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
