@@ -430,13 +430,13 @@ async function runFfmpegWithProgress(
       lastEmit = now;
 
       const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
-      safeUpdate({ status: "processing", step, progress: global, message: `${message || step} | t=${tSec.toFixed(1)}s` });
 
-      if (typeof onProgress === "function") {
-        try {
-          onProgress({ step, progress: global, outTimeSec: tSec, totalSec: totalDurationSec, updatedAt: new Date().toISOString() });
-        } catch {}
-      }
+      // Option A: pas de colonne ffmpeg/outTimeSec en DB => on met le temps dans message
+      const timeMsg = `t=${tSec.toFixed(1)}s`;
+      const baseMsg = (message || step).trim();
+      const mergedMsg = baseMsg ? `${baseMsg} | ${timeMsg}` : timeMsg;
+
+      safeUpdate({ status: "processing", step, progress: global, message: mergedMsg });
 
       setRuntime(jobId, {
         step,
@@ -513,6 +513,7 @@ async function runFfmpegWithProgress(
     });
   });
 }
+
 
 // ------------------------------------------------------
 // ffprobe summary
