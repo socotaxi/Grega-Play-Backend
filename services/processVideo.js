@@ -349,7 +349,7 @@ async function runFfmpegWithProgress(
     }
 
     // Progression machine-readable sur stderr
-    if (expectProgress && bin === "ffmpeg" && !args.includes("-progress")) {
+    if (bin === "ffmpeg" && !args.includes("-progress")) {
       const idx = args.indexOf("-nostdin");
       const insertAt = idx >= 0 ? idx + 1 : 0;
       args.splice(insertAt, 0, "-progress", "pipe:2", "-nostats");
@@ -430,28 +430,11 @@ async function runFfmpegWithProgress(
       lastEmit = now;
 
       const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
-      const updatedAt = new Date().toISOString();
-      const payload = {
-        step,
-        progress: global,
-        outTimeSec: tSec,
-        totalSec: totalDurationSec,
-        updatedAt,
-      };
+      safeUpdate({ status: "processing", step, progress: global, message: `${message || step} | t=${tSec.toFixed(1)}s` });
 
-      // ✅ update DB (throttled by the checks above)
-      safeUpdate({
-        status: "processing",
-        step,
-        progress: global,
-        // Option A: on stocke outTimeSec dans message (pas de colonne dédiée)
-        message: `${message || step} | t=${Number.isFinite(tSec) ? tSec.toFixed(1) : "?"}s`,
-      });
-
-      // ✅ optional callback
       if (typeof onProgress === "function") {
         try {
-          onProgress(payload);
+          onProgress({ step, progress: global, outTimeSec: tSec, totalSec: totalDurationSec, updatedAt: new Date().toISOString() });
         } catch {}
       }
 
@@ -918,7 +901,6 @@ async function runFFmpegFilterConcat(
       progressBase,
       progressSpan,
       message: "Concaténation en cours...",
-    expectProgress: true,
     });
     return;
   }
@@ -978,7 +960,6 @@ async function runFFmpegFilterConcat(
     progressBase,
     progressSpan,
     message: "Concaténation en cours...",
-    expectProgress: true,
   });
 }
 
@@ -1032,7 +1013,6 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
     progressBase,
     progressSpan,
     message: "Intro/Outro en cours...",
-    expectProgress: true,
   });
 }
 
@@ -1101,7 +1081,6 @@ async function addIntroOutroWithMusic(
     progressBase,
     progressSpan,
     message: "Intro/Outro en cours...",
-    expectProgress: true,
   });
 
   logJson("✅ Intro/Outro + music OK", { outputPath });
@@ -1151,7 +1130,6 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
     progressBase,
     progressSpan,
     message: "Watermark en cours...",
-    expectProgress: true,
   });
 }
 
