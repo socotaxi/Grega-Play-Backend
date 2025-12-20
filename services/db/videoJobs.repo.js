@@ -33,6 +33,21 @@ export async function updateVideoJob(jobId, patch) {
 
   if (error) throw error;
   return data;
+
+  const p = { ...(patch || {}) };
+
+  // mapping camelCase -> snake_case
+  if (p.outTimeSec !== undefined) {
+    p.out_time_sec = p.outTimeSec;
+    delete p.outTimeSec;
+  }
+  if (p.updatedAt !== undefined) {
+    p.updated_at = p.updatedAt;
+    delete p.updatedAt;
+  }
+// ... puis ton update supabase habituel
+  return supabase.from("video_jobs").update(p).eq("id", jobId);
+
 }
 
 export async function getVideoJob(jobId) {
