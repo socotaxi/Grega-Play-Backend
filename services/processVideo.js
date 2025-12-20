@@ -796,12 +796,15 @@ async function normalizeVideo(
   `setpts=N/(${fps}*TB),` +
   `scale=720:1280:force_original_aspect_ratio=decrease,` +
   `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `setsar=1,format=yuv420p`;
-  
+  `setsar=1,format=yuv420p,` +
+  `trim=duration=${capSec},setpts=PTS-STARTPTS`;
+
+
   const aFilter =
-    `asetpts=PTS-STARTPTS,` +
-    `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,` +
-    `aresample=48000`;
+  `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,` +
+  `aresample=48000,` +
+  `atrim=duration=${capSec},asetpts=PTS-STARTPTS`;
+
 
   // ✅ Durée + borne anti-hang
   const maxClip = getMaxClipSec();
