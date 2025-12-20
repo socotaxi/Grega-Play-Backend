@@ -497,6 +497,7 @@ if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("prog
 if (k === "out_time_us") {
   const us = Number(v);
   const tSec = us / 1_000_000;
+  if (tSec > (totalDurationSec * 2)) return;
   if (Number.isFinite(tSec)) progressState.__tSec = tSec;
 }
 
