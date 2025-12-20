@@ -469,7 +469,7 @@ console.log("[PROGRESS_DB]", {
         const s = chunk.toString();
 
 // DEBUG: confirmer que FFmpeg envoie bien -progress pipe:2 sur stderr
-if (s.includes("out_time_ms=") || s.includes("progress=")) {
+if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("progress=")) {
   console.log("[PROGRESS_RAW]", s.trim().split(/\r?\n/).slice(0, 6).join(" | "));
 }
 
@@ -492,11 +492,20 @@ if (s.includes("out_time_ms=") || s.includes("progress=")) {
             const v = line.slice(eq + 1).trim();
             progressState[k] = v;
 
-            // on_time_ms est en microsecondes
-            if (k === "out_time_ms") {
-              const tSec = Number(v) / 1_000_000;
-              if (Number.isFinite(tSec)) progressState.__tSec = tSec;
-            }
+            // out_time_us = microsecondes (Railway log: out_time_us=...)
+// out_time_ms = millisecondes (selon versions FFmpeg)
+if (k === "out_time_us") {
+  const us = Number(v);
+  const tSec = us / 1_000_000;
+  if (Number.isFinite(tSec)) progressState.__tSec = tSec;
+}
+
+if (k === "out_time_ms") {
+  const ms = Number(v);
+  const tSec = ms / 1_000;
+  if (Number.isFinite(tSec)) progressState.__tSec = tSec;
+}
+
 
             // on commit surtout quand ffmpeg annonce progress=continue/end
             if (k === "progress" && (v === "continue" || v === "end")) {
@@ -943,6 +952,8 @@ async function runFFmpegFilterConcat(
       progressBase,
       progressSpan,
       message: "Concaténation en cours...",
+      expectProgress: true,
+
     });
     return;
   }
@@ -1002,6 +1013,7 @@ async function runFFmpegFilterConcat(
     progressBase,
     progressSpan,
     message: "Concaténation en cours...",
+    expectProgress: true,
   });
 }
 
@@ -1055,6 +1067,7 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
     progressBase,
     progressSpan,
     message: "Intro/Outro en cours...",
+    expectProgress: true,
   });
 }
 
@@ -1123,6 +1136,7 @@ async function addIntroOutroWithMusic(
     progressBase,
     progressSpan,
     message: "Intro/Outro en cours...",
+    expectProgress: true,
   });
 
   logJson("✅ Intro/Outro + music OK", { outputPath });
@@ -1172,6 +1186,7 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
     progressBase,
     progressSpan,
     message: "Watermark en cours...",
+    expectProgress: true,
   });
 }
 
