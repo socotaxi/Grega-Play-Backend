@@ -452,6 +452,7 @@ async function runFfmpegWithProgress(
 
         if (!totalDurationSec || totalDurationSec <= 0) return;
 
+        // ffmpeg -progress pipe:2 -> out_time_ms est en microsecondes
         const msMatches = s.match(/out_time_ms=(\d+)/g);
         if (msMatches?.length) {
           const last = msMatches[msMatches.length - 1].replace("out_time_ms=", "");
@@ -868,7 +869,6 @@ async function normalizeVideo(
   await getVideoDurationSafe(outputPath, `normalized_${globalIndex ?? "x"}`);
 }
 
-
 // ------------------------------------------------------
 // Concat xfade + acrossfade
 // ------------------------------------------------------
@@ -958,63 +958,21 @@ async function runFFmpegFilterConcat(
 // ------------------------------------------------------
 // Intro/Outro + musique (premium) + watermark
 // ------------------------------------------------------
-async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, { jobId, progressBase = 60, progressSpan = 25 } = {}) {
-  const introDur = 3;
-  const outroDur = 2;
-  const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro");
 
-  
-  const targetSec = introDur + (coreDur || 0) + outroDur;
-  const totalDur = introDur + (coreDur || 0) + outroDur || null;
-
-  const coreHasAudio = await hasAudioStream(corePath);
-
-  const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
-
-  let filter;
-  if (coreHasAudio) {
-    filter =
-      `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
-      `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
-      `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
-      `[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${targetSec},setpts=PTS-STARTPTS[v];` +
-      `[1:a]adelay=3000|3000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[voice];` +
-      `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[bed];` +
-      `[bed][voice]amix=inputs=2:duration=first:dropout_transition=2,atrim=duration=${targetSec},asetpts=PTS-STARTPTS[a]`;
-  } else {
-    filter =
-      `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v0];` +
-      `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v1];` +
-      `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[v2];` +
-      `[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${targetSec},setpts=PTS-STARTPTS[v];` +
-      `[3:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000[a]`;
-  }
-
-  const cmd =
-    `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
-    `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
-    `${silenceInput} -filter_complex "${filter}" ` +
-    `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
-
-  console.log("➡️ FFmpeg intro/outro:", cmd);
-  await runFfmpegWithProgress(cmd, {
-    jobId,
-    step: "intro_outro",
-    label: "intro_outro",
-    totalDurationSec: totalDur,
-    progressBase,
-    progressSpan,
-    message: "Intro/Outro en cours...",
-  });
-}
-
-async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, { jobId, progressBase = 60, progressSpan = 25 } = {}) {
+// ✅ GARDE UNE SEULE VERSION (la plus robuste) — FIX du crash Railway "already been declared"
+async function addIntroOutroNoMusic(
+  corePath,
+  outputPath,
+  introPath,
+  outroPath,
+  { jobId, progressBase = 60, progressSpan = 25 } = {}
+) {
   const introDur = 3;
   const outroDur = 2;
 
   const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro");
   const safeCore = Number.isFinite(coreDur) ? coreDur : 0;
-  const totalDur = introDur + safeCore + outroDur; // ✅ durée finale cible (ex: 34.119)
+  const totalDur = introDur + safeCore + outroDur; // ✅ durée finale cible
 
   const coreHasAudio = await hasAudioStream(corePath);
 
@@ -1027,8 +985,8 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
 `;
 
   // ✅ Audio :
-  // - si core a un audio : on le décale de 3s, on remplit avec apad (silence), puis on coupe à totalDur
-  // - sinon : on crée un silence de totalDur
+  // - si core a un audio : on le décale de 3s, on complète avec apad (silence), puis on coupe à totalDur
+  // - sinon : silence lavfi de totalDur
   if (coreHasAudio) {
     filter += `
 [1:a]adelay=${Math.round(introDur * 1000)}|${Math.round(introDur * 1000)},
@@ -1054,7 +1012,7 @@ asetpts=PTS-STARTPTS[a]
   // 0 = intro image (3s)
   // 1 = core video
   // 2 = outro image (2s)
-  // 3 = silence (uniquement utile si core n'a pas d'audio)
+  // 3 = silence (uniquement si core n'a pas d'audio)
   const silenceInput = coreHasAudio
     ? ""
     : ` -f lavfi -t ${Math.max(1, Math.ceil(totalDur))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
@@ -1085,7 +1043,10 @@ asetpts=PTS-STARTPTS[a]
   logJson("✅ Intro/Outro OK", { outputPath, totalDur });
 }
 
+// (la fonction addIntroOutroWithMusic est supposée exister dans ton fichier original ; je ne la modifie pas ici)
+// Si elle est plus bas dans ton fichier complet, laisse-la telle quelle.
 
+// ✅ Watermark
 async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85, progressSpan = 10 } = {}) {
   const watermarkPath = path.join(process.cwd(), "assets", "watermark.png");
 
@@ -1101,10 +1062,9 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
 
   const dur = await getVideoDurationSafe(inputPath, "watermark_input");
 
+  // ✅ Ton filterComplex est OK
   const filterComplex = `[1:v]scale=150:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto[v]`;
-
-  const cleanFilterComplex = filterComplex.replace(/\s*\n\s*/g, ' ').trim();
-
+  const cleanFilterComplex = filterComplex.replace(/\s*\n\s*/g, " ").trim();
 
   const cmd =
     `ffmpeg -nostdin -y -i "${inputPath}" -i "${watermarkPath}" ` +
