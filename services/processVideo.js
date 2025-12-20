@@ -366,6 +366,11 @@ async function runFfmpegWithProgress(
     let lastLocal = -1;
     let lastEmit = 0;
 
+    // buffer + state pour parser -progress pipe:2 de façon robuste (lignes key=value)
+    let progressBuf = "";
+    let progressState = {};
+
+
     // watchdog d'inactivité
     let lastActivityAt = Date.now();
     const bumpActivity = () => {
@@ -460,14 +465,37 @@ async function runFfmpegWithProgress(
 
         if (!totalDurationSec || totalDurationSec <= 0) return;
 
-        const msMatches = s.match(/out_time_ms=(\d+)/g);
-        if (msMatches?.length) {
-          const last = msMatches[msMatches.length - 1].replace("out_time_ms=", "");
-          const tSec = Number(last) / 1_000_000;
-          if (Number.isFinite(tSec)) emitProgress(tSec);
+        // Parser robuste pour -progress pipe:2 (key=value). Les morceaux peuvent arriver "coupés",
+        // donc on bufferise et on traite ligne par ligne.
+        if (expectProgress) {
+          progressBuf += s;
+          const lines = progressBuf.split(/\r?\n/);
+          progressBuf = lines.pop() || "";
+
+          for (const line of lines) {
+            const eq = line.indexOf("=");
+            if (eq === -1) continue;
+            const k = line.slice(0, eq).trim();
+            const v = line.slice(eq + 1).trim();
+            progressState[k] = v;
+
+            // on_time_ms est en microsecondes
+            if (k === "out_time_ms") {
+              const tSec = Number(v) / 1_000_000;
+              if (Number.isFinite(tSec)) progressState.__tSec = tSec;
+            }
+
+            // on commit surtout quand ffmpeg annonce progress=continue/end
+            if (k === "progress" && (v === "continue" || v === "end")) {
+              const tSec = progressState.__tSec;
+              if (Number.isFinite(tSec)) emitProgress(tSec);
+              progressState = {};
+            }
+          }
           return;
         }
 
+        // Fallback: parsing regex sur les chunks (mode sans -progress)
         const outMatches = s.match(/out_time=([0-9:.]+)/g);
         if (outMatches?.length) {
           const last = outMatches[outMatches.length - 1].replace("out_time=", "").trim();
