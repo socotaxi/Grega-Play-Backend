@@ -103,7 +103,7 @@ function runCmdWithTimeout(cmd, label) {
       bump();
       const s = d.toString();
       stderrBuf += s;
-      // console.log(s.trimEnd());
+      console.log(s.trimEnd());
     });
 
     child.on("error", (error) => {
