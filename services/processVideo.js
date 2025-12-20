@@ -305,8 +305,8 @@ async function runFfmpegWithProgress(
     progressBase = 0,
     progressSpan = 100,
     message = "",
-    expectProgress = false,   // ✅ NEW
-    onProgress = null,        // ✅ NEW
+    expectProgress = false, // ✅ progress pipe:2
+    onProgress = null,      // ✅ callback (ex: update repo, ws, etc.)
   } = {}
 ) {
   const safeUpdate = (patch) => {
@@ -324,8 +324,8 @@ async function runFfmpegWithProgress(
     return updateVideoJob(jobId, patch).catch((e) => {
       const msg = String(e?.message || e);
 
-      // Erreur typique: "Could not find the 'outTimeSec' column of 'video_jobs' in the schema cache"
-      if (msg.includes("outTimeSec") || msg.includes("'outTimeSec'")) {
+      // Erreur typique Supabase cache: "Could not find the 'outTimeSec' column of 'video_jobs' in the schema cache"
+      if (msg.includes("outTimeSec") || msg.includes("'outTimeSec'") || msg.includes("updatedAt") || msg.includes("'updatedAt'")) {
         safeUpdate.__noOutTime = true;
         const { outTimeSec, updatedAt, ...rest } = patch || {};
         return updateVideoJob(jobId, rest).catch((e2) =>
@@ -369,7 +369,8 @@ async function runFfmpegWithProgress(
       args.unshift("-nostdin");
     }
 
-    // Progression machine-readable sur stderr
+    // Progression machine-readable sur stderr (compatible ffmpeg 4.3.x)
+    // IMPORTANT: pas de -stats_period (non supporté sur ta version)
     if (bin === "ffmpeg" && !args.includes("-progress")) {
       const idx = args.indexOf("-nostdin");
       const insertAt = idx >= 0 ? idx + 1 : 0;
@@ -390,7 +391,6 @@ async function runFfmpegWithProgress(
     // buffer + state pour parser -progress pipe:2 de façon robuste (lignes key=value)
     let progressBuf = "";
     let progressState = {};
-
 
     // watchdog d'inactivité
     let lastActivityAt = Date.now();
@@ -447,6 +447,9 @@ async function runFfmpegWithProgress(
       if (!totalDurationSec || totalDurationSec <= 0) return;
       if (!Number.isFinite(tSec) || tSec < 0) return;
 
+      // borne simple pour ignorer des valeurs aberrantes
+      if (tSec > totalDurationSec * 3) return;
+
       const local = Math.max(0, Math.min(100, Math.round((tSec / totalDurationSec) * 100)));
       const now = Date.now();
       if (local === lastLocal) return;
@@ -457,18 +460,42 @@ async function runFfmpegWithProgress(
 
       const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
 
-      // Option A: pas de colonne ffmpeg/outTimeSec en DB => on met le temps dans message
       const timeMsg = `t=${tSec.toFixed(1)}s`;
       const baseMsg = (message || step).trim();
       const mergedMsg = baseMsg ? `${baseMsg} | ${timeMsg}` : timeMsg;
 
-console.log("[PROGRESS_DB]", {
-  step,
-  progress: global,
-  tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
-});
+      const updatedAt = new Date().toISOString();
 
-      safeUpdate({ status: "processing", step, progress: global, message: mergedMsg });
+      // callback optionnel (ex: mise à jour repo / websocket)
+      if (typeof onProgress === "function") {
+        try {
+          onProgress({
+            jobId,
+            step,
+            progress: global,
+            outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
+            updatedAt,
+            totalDurationSec,
+          });
+        } catch (e) {
+          logJson("⚠️ onProgress failed", { jobId, step, error: String(e?.message || e) });
+        }
+      }
+
+      console.log("[PROGRESS_DB]", {
+        step,
+        progress: global,
+        tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
+      });
+
+      safeUpdate({
+        status: "processing",
+        step,
+        progress: global,
+        message: mergedMsg,
+        outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
+        updatedAt,
+      });
 
       setRuntime(jobId, {
         step,
@@ -489,18 +516,16 @@ console.log("[PROGRESS_DB]", {
         bumpActivity();
         const s = chunk.toString();
 
-// DEBUG: confirmer que FFmpeg envoie bien -progress pipe:2 sur stderr
-if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("progress=")) {
-  console.log("[PROGRESS_RAW]", s.trim().split(/\r?\n/).slice(0, 6).join(" | "));
-}
-
+        // DEBUG: confirmer que FFmpeg envoie bien -progress pipe:2 sur stderr
+        if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("progress=")) {
+          console.log("[PROGRESS_RAW]", s.trim().split(/\r?\n/).slice(0, 6).join(" | "));
+        }
 
         stderrAll += s;
 
         if (!totalDurationSec || totalDurationSec <= 0) return;
 
-        // Parser robuste pour -progress pipe:2 (key=value). Les morceaux peuvent arriver "coupés",
-        // donc on bufferise et on traite ligne par ligne.
+        // Parser robuste pour -progress pipe:2 (key=value).
         if (expectProgress) {
           progressBuf += s;
           const lines = progressBuf.split(/\r?\n/);
@@ -513,32 +538,37 @@ if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("prog
             const v = line.slice(eq + 1).trim();
             progressState[k] = v;
 
-            // out_time_us = microsecondes (Railway log: out_time_us=...)
-// out_time_ms = millisecondes (selon versions FFmpeg)
-if (k === "out_time_us") {
-  const us = Number(v);
-  const tSec = us / 1_000_000;
-  if (tSec > (totalDurationSec * 2)) return;
-  if (Number.isFinite(tSec)) progressState.__tSec = tSec;
-}
+            // out_time_us: microsecondes
+            if (k === "out_time_us") {
+              const us = Number(v);
+              const tSec = us / 1_000_000;
+              if (Number.isFinite(tSec)) progressState.__tSec = tSec;
+            }
 
-if (k === "out_time_ms") {
-  const raw = Number(v);
+            // out_time_ms: selon les builds, parfois c'est en ms, parfois en us.
+            if (k === "out_time_ms") {
+              const raw = Number(v);
+              let tSec = NaN;
 
-  // ⚠️ Selon les builds FFmpeg, on observe parfois out_time_ms qui a en réalité une valeur en microsecondes.
-  // Heuristique simple : si la valeur est très grande, on la traite comme des microsecondes.
-  // Exemple: 27s => 27093333 (us) au lieu de 27093 (ms).
-  let tSec = NaN;
-  if (Number.isFinite(raw)) {
-    if (raw >= 10_000_000) tSec = raw / 1_000_000; // probablement microsecondes
-    else tSec = raw / 1_000; // millisecondes normales
-  }
+              if (Number.isFinite(raw)) {
+                // 1) hypothèse "ms"
+                const tMs = raw / 1_000;
 
-  if (Number.isFinite(tSec)) progressState.__tSec = tSec;
-}
+                // 2) si la valeur "ms" dépasse largement la durée totale, c'est sûrement des microsecondes
+                // Exemple observé: 0.874s => out_time_ms=874667 (qui est en réalité us)
+                if (tMs > totalDurationSec * 2) {
+                  tSec = raw / 1_000_000; // traiter comme us
+                } else if (raw >= 10_000_000) {
+                  tSec = raw / 1_000_000; // très grande => us quasi certain
+                } else {
+                  tSec = tMs; // ms normal
+                }
+              }
 
+              if (Number.isFinite(tSec)) progressState.__tSec = tSec;
+            }
 
-            // on commit surtout quand ffmpeg annonce progress=continue/end
+            // On commit surtout quand ffmpeg annonce progress=continue/end
             if (k === "progress" && (v === "continue" || v === "end")) {
               const tSec = progressState.__tSec;
               if (Number.isFinite(tSec)) emitProgress(tSec);
