@@ -728,7 +728,6 @@ async function normalizeVideo(
   const vFilter =
     `settb=AVTB,` +
     `fps=${fps},` +
-    `setpts=N/(${fps}*TB),` +
     `scale=720:1280:force_original_aspect_ratio=decrease,` +
     `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
     `setsar=1,format=yuv420p,` +
@@ -838,7 +837,6 @@ async function runFFmpegFilterConcat(
   const parts = [];
   for (let i = 0; i < n; i++) {
     parts.push(
-      `[${i}:v]settb=AVTB,fps=30,setpts=N/(30*TB),format=yuv420p,` +
         `scale=720:1280:force_original_aspect_ratio=decrease,` +
         `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v${i}];` +
         `[${i}:a]asetpts=PTS-STARTPTS,` +
