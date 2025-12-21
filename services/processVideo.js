@@ -897,35 +897,21 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
 
   const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
 
-  let filter;
+ let filter;
 
-    if (coreHasAudio) {
-    filter =
-  `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `fps=30,setsar=1,format=yuv420p[v0];` +     // ✅
-  `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `fps=30,setsar=1,format=yuv420p[v1];` +     // ✅
-  `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `fps=30,setsar=1,format=yuv420p[v2];`       // ✅
+if (coreHasAudio) {
+  filter =
+    `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
+    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
+    `fps=30,setsar=1,format=yuv420p[v1]`;
+} else {
+  filter =
+    `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
+    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
+    `fps=30,setsar=1,format=yuv420p[v1]`;
+}
 
-  } else {
-    filter =
-  `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `fps=30,setsar=1,format=yuv420p[v0];` +     // ✅
-  `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `fps=30,setsar=1,format=yuv420p[v1];` +     // ✅
-  `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-  `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-  `fps=30,setsar=1,format=yuv420p[v2];`       // ✅
-
-  }
-
-const cleanFilter = filter.trim().replace(/;+\s*$/, "");
+const cleanFilter = filter.trim();
 
 
   const cmd =
