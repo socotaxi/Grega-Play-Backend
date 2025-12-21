@@ -434,6 +434,7 @@ async function runFfmpegWithProgress(
       finishReject(err);
     }, 5000);
 
+    let lastEmittedTsec = 0;
     const emitProgress = (tSec) => {
       if (!totalDurationSec || totalDurationSec <= 0) return;
       if (!Number.isFinite(tSec) || tSec < 0) return;
@@ -441,7 +442,14 @@ async function runFfmpegWithProgress(
       // borne simple pour ignorer des valeurs aberrantes
       if (tSec > totalDurationSec * 3) return;
 
-      const local = Math.max(0, Math.min(100, Math.round((tSec / totalDurationSec) * 100)));
+      // ✅ garde monotone: ne jamais reculer (tolérance 250ms)
+      if (tSec < lastEmittedTsec - 0.25) return;
+      lastEmittedTsec = Math.max(lastEmittedTsec, tSec);
+
+      // ✅ clamp pour le calcul (évite >100 et stabilise)
+      const tForPercent = Math.min(lastEmittedTsec, totalDurationSec);
+
+      const local = Math.max(0, Math.min(100, Math.round((tForPercent / totalDurationSec) * 100)));
       const now = Date.now();
       if (local === lastLocal) return;
       if (now - lastEmit < 400 && local < 100) return;
@@ -464,7 +472,7 @@ async function runFfmpegWithProgress(
             jobId,
             step,
             progress: global,
-            outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
+            outTimeSec: Number.isFinite(lastEmittedTsec) ? Number(lastEmittedTsec.toFixed(3)) : null,
             updatedAt,
             totalDurationSec,
           });
@@ -529,11 +537,37 @@ async function runFfmpegWithProgress(
             const v = line.slice(eq + 1).trim();
             progressState[k] = v;
 
-            // out_time_us: microsecondes
+            // out_time_us: selon les builds, on a déjà vu des valeurs "trop petites" ou ambiguës.
+            // ✅ heuristique: tester µs (1e6) et ms (1e3), garder le plus plausible.
             if (k === "out_time_us") {
-              const us = Number(v);
-              const tSec = us / 1_000_000;
-              if (Number.isFinite(tSec)) progressState.__tSec = tSec;
+              const raw = Number(v);
+              if (Number.isFinite(raw)) {
+                const candUs = raw / 1_000_000; // hypothèse microsecondes
+                const candMs = raw / 1_000;     // hypothèse millisecondes
+
+                let chosen = candUs;
+                if (totalDurationSec && totalDurationSec > 0) {
+                  const limit = totalDurationSec * 3;
+                  const okUs = candUs >= 0 && candUs <= limit;
+                  const okMs = candMs >= 0 && candMs <= limit;
+
+                  if (okUs && okMs) {
+                    // choisir celui le plus proche du dernier tSec connu (si existant)
+                    const prev = Number.isFinite(progressState.__tSec) ? progressState.__tSec : 0;
+                    chosen =
+                      Math.abs(candUs - prev) <= Math.abs(candMs - prev) ? candUs : candMs;
+                  } else if (okMs && !okUs) {
+                    chosen = candMs;
+                  } else {
+                    chosen = candUs;
+                  }
+                } else {
+                  // sans durée totale, fallback simple
+                  chosen = raw >= 10_000_000 ? candUs : candMs;
+                }
+
+                if (Number.isFinite(chosen)) progressState.__tSec = chosen;
+              }
             }
 
             // out_time_ms: selon les builds, parfois c'est en ms, parfois en us.
