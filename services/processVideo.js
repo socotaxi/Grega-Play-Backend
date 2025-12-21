@@ -21,6 +21,8 @@ import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import fetch from "cross-fetch";
 import { promisify } from "util";
+import { runCmdWithTimeout } from "./videoProcessing/ffmpegRunner.js";
+
 
 const PROCESSVIDEO_BUILD_STAMP =
   process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ||
@@ -284,16 +286,7 @@ async function runCmd(cmd, { label = "cmd" } = {}) {
 // ------------------------------------------------------
 // FFmpeg runner avec progression (sans shell, parsing args)
 // ------------------------------------------------------
-function parseFfmpegTimeToSeconds(t) {
-  if (!t) return null;
-  const parts = String(t).trim().split(":");
-  if (parts.length < 1 || parts.length > 3) return null;
-  const nums = parts.map((x) => Number(x));
-  if (nums.some((x) => !Number.isFinite(x))) return null;
-  if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
-  if (nums.length === 2) return nums[0] * 60 + nums[1];
-  return nums[0];
-}
+
 
 async function runFfmpegWithProgress(
   cmd,
@@ -305,15 +298,13 @@ async function runFfmpegWithProgress(
     progressBase = 0,
     progressSpan = 100,
     message = "",
-    expectProgress = false, // ✅ progress pipe:2
-    onProgress = null,      // ✅ callback (ex: update repo, ws, etc.)
+    expectProgress = false, // true si la commande contient "-progress pipe:2"
+    onProgress = null,      // callback optionnel (ws, logs, etc.)
   } = {}
 ) {
   const safeUpdate = (patch) => {
     if (!jobId) return;
 
-    // Certains environnements (ou schémas) n'ont pas encore les colonnes outTimeSec/updatedAt.
-    // On tente d'abord "plein", puis on désactive proprement si Supabase renvoie une erreur.
     if (safeUpdate.__noOutTime === true) {
       const { outTimeSec, updatedAt, ...rest } = patch || {};
       return updateVideoJob(jobId, rest).catch((e) =>
@@ -323,331 +314,120 @@ async function runFfmpegWithProgress(
 
     return updateVideoJob(jobId, patch).catch((e) => {
       const msg = String(e?.message || e);
-
-      // Erreur typique Supabase cache: "Could not find the 'outTimeSec' column of 'video_jobs' in the schema cache"
-      if (msg.includes("outTimeSec") || msg.includes("'outTimeSec'") || msg.includes("updatedAt") || msg.includes("'updatedAt'")) {
+      if (msg.includes("outTimeSec") || msg.includes("updatedAt")) {
         safeUpdate.__noOutTime = true;
         const { outTimeSec, updatedAt, ...rest } = patch || {};
         return updateVideoJob(jobId, rest).catch((e2) =>
           logJson("⚠️ updateVideoJob failed", { jobId, step, error: String(e2?.message || e2) })
         );
       }
-
       logJson("⚠️ updateVideoJob failed", { jobId, step, error: msg });
     });
   };
 
+  const base = Math.max(0, Math.min(100, progressBase));
+  const span = Math.max(0, Math.min(100, progressSpan));
+
   safeUpdate({
     status: "processing",
     step,
-    progress: Math.max(0, Math.min(100, progressBase)),
+    progress: base,
     message: message || step,
     error: null,
   });
 
   setRuntime(jobId, {
     step,
-    percent: Math.max(0, Math.min(100, progressBase)),
+    percent: base,
     totalSec: totalDurationSec ?? null,
   });
 
-  return new Promise((resolve, reject) => {
-    let settled = false;
+  let lastLocal = -1;
+  let lastEmit = 0;
+  let lastEmittedTsec = 0;
 
-    const parts = splitCommand(cmd);
-    const bin = parts[0];
-    const args = parts.slice(1);
+  const emitProgress = (tSec) => {
+    if (!totalDurationSec || totalDurationSec <= 0) return;
+    if (!Number.isFinite(tSec) || tSec < 0) return;
 
-    if (!bin) {
-      const err = new Error(`Commande FFmpeg vide (${label})`);
-      safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
-      setRuntime(jobId, { step, percent: 100, error: err.message });
-      return reject(err);
-    }
+    // ne jamais reculer (tolérance 250ms)
+    if (tSec < lastEmittedTsec - 0.25) return;
+    lastEmittedTsec = Math.max(lastEmittedTsec, tSec);
 
-    const binBase = path.basename(bin || "").toLowerCase();
-    const isFfmpeg = binBase === "ffmpeg" || binBase === "ffmpeg.exe";
+    const tForPercent = Math.min(lastEmittedTsec, totalDurationSec);
+    const local = Math.max(0, Math.min(100, Math.round((tForPercent / totalDurationSec) * 100)));
 
-    const child = spawn(bin, args, {
-      shell: false,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const now = Date.now();
+    if (local === lastLocal) return;
+    if (now - lastEmit < 400 && local < 100) return;
 
-    let stderrAll = "";
-    let stdoutAll = "";
-    let lastLocal = -1;
-    let lastEmit = 0;
+    lastLocal = local;
+    lastEmit = now;
 
-    // buffer + state pour parser -progress pipe:2 de façon robuste (lignes key=value)
-    let progressBuf = "";
-    let progressState = {};
+    const global = Math.max(0, Math.min(100, Math.round(base + (local / 100) * span)));
+    const updatedAt = new Date(now).toISOString();
 
-    // watchdog d'inactivité
-    let lastActivityAt = Date.now();
-    const bumpActivity = () => {
-      lastActivityAt = Date.now();
-    };
+    const timeMsg = `t=${tSec.toFixed(1)}s`;
+    const baseMsg = (message || step).trim();
+    const mergedMsg = baseMsg ? `${baseMsg} | ${timeMsg}` : timeMsg;
 
-    const cleanup = () => {
+    if (typeof onProgress === "function") {
       try {
-        clearTimeout(killTimer);
-      } catch {}
-      try {
-        clearInterval(inactivityTimer);
-      } catch {}
-    };
-
-    const finishReject = (err) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(err);
-    };
-
-    const finishResolve = (val) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(val);
-    };
-
-    const killTimer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-      const err = new Error(`Timeout FFmpeg (${label}) after ${FFMPEG_TIMEOUT_MS}ms`);
-      safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
-      setRuntime(jobId, { step, percent: 100, error: err.message });
-      finishReject(err);
-    }, FFMPEG_TIMEOUT_MS);
-
-    const inactivityTimer = setInterval(() => {
-      const idle = Date.now() - lastActivityAt;
-      if (idle < FFMPEG_INACTIVITY_MS) return;
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-      const err = new Error(`FFmpeg inactive for ${FFMPEG_INACTIVITY_MS}ms (${label})`);
-      safeUpdate({ status: "failed", step, progress: 100, message: err.message, error: err.message });
-      setRuntime(jobId, { step, percent: 100, error: err.message });
-      finishReject(err);
-    }, 5000);
-
-    let lastEmittedTsec = 0;
-    const emitProgress = (tSec) => {
-      if (!totalDurationSec || totalDurationSec <= 0) return;
-      if (!Number.isFinite(tSec) || tSec < 0) return;
-
-      // borne simple pour ignorer des valeurs aberrantes
-      if (tSec > totalDurationSec * 3) return;
-
-      // ✅ garde monotone: ne jamais reculer (tolérance 250ms)
-      if (tSec < lastEmittedTsec - 0.25) return;
-      lastEmittedTsec = Math.max(lastEmittedTsec, tSec);
-
-      // ✅ clamp pour le calcul (évite >100 et stabilise)
-      const tForPercent = Math.min(lastEmittedTsec, totalDurationSec);
-
-      const local = Math.max(0, Math.min(100, Math.round((tForPercent / totalDurationSec) * 100)));
-      const now = Date.now();
-      if (local === lastLocal) return;
-      if (now - lastEmit < 400 && local < 100) return;
-
-      lastLocal = local;
-      lastEmit = now;
-
-      const global = Math.max(0, Math.min(100, Math.round(progressBase + (local / 100) * progressSpan)));
-
-      const timeMsg = `t=${tSec.toFixed(1)}s`;
-      const baseMsg = (message || step).trim();
-      const mergedMsg = baseMsg ? `${baseMsg} | ${timeMsg}` : timeMsg;
-
-      const updatedAt = new Date().toISOString();
-
-      // callback optionnel (ex: mise à jour repo / websocket)
-      if (typeof onProgress === "function") {
-        try {
-          onProgress({
-            jobId,
-            step,
-            progress: global,
-            outTimeSec: Number.isFinite(lastEmittedTsec) ? Number(lastEmittedTsec.toFixed(3)) : null,
-            updatedAt,
-            totalDurationSec,
-          });
-        } catch (e) {
-          logJson("⚠️ onProgress failed", { jobId, step, error: String(e?.message || e) });
-        }
-      }
-
-      console.log("[PROGRESS_DB]", {
-        step,
-        progress: global,
-        tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
-      });
-
-      safeUpdate({
-        status: "processing",
-        step,
-        progress: global,
-        message: mergedMsg,
-        outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
-        updatedAt,
-      });
-
-      setRuntime(jobId, {
-        step,
-        percent: global,
-        outTimeSec: tSec,
-        totalSec: totalDurationSec,
-      });
-    };
-
-    if (child.stdout)
-      child.stdout.on("data", (c) => {
-        bumpActivity();
-        stdoutAll += c.toString();
-      });
-
-    if (child.stderr) {
-      child.stderr.on("data", (chunk) => {
-        bumpActivity();
-        const s = chunk.toString();
-
-        // DEBUG: confirmer que FFmpeg envoie bien -progress pipe:2 sur stderr
-        if (s.includes("out_time_us=") || s.includes("out_time_ms=") || s.includes("progress=")) {
-          console.log("[PROGRESS_RAW]", s.trim().split(/\r?\n/).slice(0, 6).join(" | "));
-        }
-
-        stderrAll += s;
-
-        if (!totalDurationSec || totalDurationSec <= 0) return;
-
-        // Parser robuste pour -progress pipe:2 (key=value).
-        if (expectProgress) {
-          progressBuf += s;
-          const lines = progressBuf.split(/\r?\n/);
-          progressBuf = lines.pop() || "";
-
-          for (const line of lines) {
-            const eq = line.indexOf("=");
-            if (eq === -1) continue;
-            const k = line.slice(0, eq).trim();
-            const v = line.slice(eq + 1).trim();
-            progressState[k] = v;
-
-            // out_time_us: selon les builds, on a déjà vu des valeurs "trop petites" ou ambiguës.
-            // ✅ heuristique: tester µs (1e6) et ms (1e3), garder le plus plausible.
-            if (k === "out_time_us") {
-              const raw = Number(v);
-              if (Number.isFinite(raw)) {
-                const candUs = raw / 1_000_000; // hypothèse microsecondes
-                const candMs = raw / 1_000;     // hypothèse millisecondes
-
-                let chosen = candUs;
-                if (totalDurationSec && totalDurationSec > 0) {
-                  const limit = totalDurationSec * 3;
-                  const okUs = candUs >= 0 && candUs <= limit;
-                  const okMs = candMs >= 0 && candMs <= limit;
-
-                  if (okUs && okMs) {
-                    // choisir celui le plus proche du dernier tSec connu (si existant)
-                    const prev = Number.isFinite(progressState.__tSec) ? progressState.__tSec : 0;
-                    chosen =
-                      Math.abs(candUs - prev) <= Math.abs(candMs - prev) ? candUs : candMs;
-                  } else if (okMs && !okUs) {
-                    chosen = candMs;
-                  } else {
-                    chosen = candUs;
-                  }
-                } else {
-                  // sans durée totale, fallback simple
-                  chosen = raw >= 10_000_000 ? candUs : candMs;
-                }
-
-                if (Number.isFinite(chosen)) progressState.__tSec = chosen;
-              }
-            }
-
-            // out_time_ms: selon les builds, parfois c'est en ms, parfois en us.
-            if (k === "out_time_ms") {
-              const raw = Number(v);
-              let tSec = NaN;
-
-              if (Number.isFinite(raw)) {
-                // 1) hypothèse "ms"
-                const tMs = raw / 1_000;
-
-                // 2) si la valeur "ms" dépasse largement la durée totale, c'est sûrement des microsecondes
-                // Exemple observé: 0.874s => out_time_ms=874667 (qui est en réalité us)
-                if (tMs > totalDurationSec * 2) {
-                  tSec = raw / 1_000_000; // traiter comme us
-                } else if (raw >= 10_000_000) {
-                  tSec = raw / 1_000_000; // très grande => us quasi certain
-                } else {
-                  tSec = tMs; // ms normal
-                }
-              }
-
-              if (Number.isFinite(tSec)) progressState.__tSec = tSec;
-            }
-
-            // On commit surtout quand ffmpeg annonce progress=continue/end
-            if (k === "progress" && (v === "continue" || v === "end")) {
-              const tSec = progressState.__tSec;
-              if (Number.isFinite(tSec)) emitProgress(tSec);
-              progressState = {};
-            }
-          }
-          return;
-        }
-
-        // Fallback: parsing regex sur les chunks (mode sans -progress)
-        const outMatches = s.match(/out_time=([0-9:.]+)/g);
-        if (outMatches?.length) {
-          const last = outMatches[outMatches.length - 1].replace("out_time=", "").trim();
-          const tSec = parseFfmpegTimeToSeconds(last);
-          if (tSec != null) emitProgress(tSec);
-          return;
-        }
-
-        const timeMatches = s.match(/time=\s*([0-9:.]+)/g);
-        if (timeMatches?.length) {
-          const last = timeMatches[timeMatches.length - 1].replace("time=", "").trim();
-          const tSec = parseFfmpegTimeToSeconds(last);
-          if (tSec != null) emitProgress(tSec);
-        }
-      });
-    }
-
-    child.on("error", (err) => {
-      const msg = err?.message || "ffmpeg error";
-      safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
-      setRuntime(jobId, { step, percent: 100, error: msg });
-      finishReject(err);
-    });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        safeUpdate({
-          status: "processing",
+        onProgress({
+          jobId,
           step,
-          progress: Math.max(0, Math.min(100, progressBase + progressSpan)),
-          message: message || step,
-          error: null,
+          progress: global,
+          outTimeSec: Number.isFinite(lastEmittedTsec) ? Number(lastEmittedTsec.toFixed(3)) : null,
+          updatedAt,
+          totalDurationSec,
         });
-        setRuntime(jobId, { step, percent: Math.max(0, Math.min(100, progressBase + progressSpan)) });
-        return finishResolve({ stdout: stdoutAll, stderr: stderrAll });
+      } catch (e) {
+        logJson("⚠️ onProgress failed", { jobId, step, error: String(e?.message || e) });
       }
+    }
 
-      const tail = String(stderrAll || stdoutAll).slice(-4000);
-      const msg = `Erreur FFmpeg (${label}) code=${code}: ${tail}`;
-      safeUpdate({ status: "failed", step, progress: 100, message: msg, error: msg });
-      setRuntime(jobId, { step, percent: 100, error: msg });
-      finishReject(new Error(msg));
+    console.log("[PROGRESS_DB]", {
+      step,
+      progress: global,
+      tSec: Number.isFinite(tSec) ? Number(tSec.toFixed(2)) : null,
     });
+
+    safeUpdate({
+      status: "processing",
+      step,
+      progress: global,
+      message: mergedMsg,
+      outTimeSec: Number.isFinite(tSec) ? Number(tSec.toFixed(3)) : null,
+      updatedAt,
+    });
+
+    setRuntime(jobId, {
+      step,
+      percent: global,
+      outTimeSec: tSec,
+      totalSec: totalDurationSec,
+    });
+  };
+
+  const { stdout, stderr } = await runCmdWithTimeout(cmd, label, {
+    expectProgress: Boolean(expectProgress),
+    onProgress: ({ outTimeSec }) => {
+      // parsing centralisé: on reçoit outTimeSec (secondes)
+      if (Number.isFinite(outTimeSec)) emitProgress(outTimeSec);
+    },
   });
+
+  // fin OK: on fixe le step au max de son span
+  safeUpdate({
+    status: "processing",
+    step,
+    progress: Math.max(0, Math.min(100, base + span)),
+    message: message || step,
+    error: null,
+  });
+  setRuntime(jobId, { step, percent: Math.max(0, Math.min(100, base + span)) });
+
+  return { stdout, stderr };
 }
 
 

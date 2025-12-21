@@ -1,4 +1,4 @@
-// /services/videoProcessing/ffmpegRunner.js
+// backend/services/videoProcessing/ffmpegRunner.js
 import { spawn } from "child_process";
 
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
@@ -33,97 +33,97 @@ function tail(str, max = 6000) {
 
 /**
  * Parse les lignes de progress FFmpeg (quand -progress pipe:2).
- * Format typique:
- * out_time=00:00:12.345678 (le plus fiable quand présent)
- * out_time_ms=12345678     (⚠️ souvent microsecondes selon builds FFmpeg)
- * out_time_us=12345678     (microsecondes)
- * progress=continue|end
  *
- * Patch:
- * - Priorité: out_time (HH:MM:SS.xxx)
- * - Fallback: out_time_ms / 1e6
- * - Fallback: out_time_us / 1e6
- * - Monotone: ne jamais reculer (tolérance 250ms)
- * - Throttle intégré (limite les callbacks)
+ * Remarques importantes FFmpeg:
+ * - out_time_us est en microsecondes
+ * - out_time_ms est malheureusement aussi en microsecondes (malgré son nom)
+ * - out_time = "HH:MM:SS.micro" (le plus lisible)
+ *
+ * On centralise tout ici, et on n'émet qu'au moment des événements "progress=continue|end".
  */
 function createProgressParser({
   label,
   onProgress,
-  throttleMs,
+  throttleMs = DEFAULT_PROGRESS_THROTTLE_MS,
   totalDurationSec = null,
-}) {
+} = {}) {
   let leftover = "";
 
-  let lastOutTime = null; // ex: "00:00:12.345678"
-  let lastOutTimeMsRaw = null; // ex: "12345678"
-  let lastOutTimeUsRaw = null; // ex: "12345678"
+  let lastOutTime = null; // "00:00:12.345678"
+  let lastOutTimeUsRaw = null; // "12345678" (µs)
+  let lastOutTimeMsRaw = null; // "12345678" (µs, malgré le nom)
 
-  // ✅ monotone: ne jamais reculer
-  let lastEmittedSec = 0;
-
+  let lastEmittedSec = 0; // monotone (ne recule jamais)
   let lastProgressEventAt = Date.now();
 
   // throttle
   let lastEmitAt = 0;
   const shouldEmitNow = (now, progressValue) => {
-    if (progressValue === "end") return true;
+    if (progressValue === "end") return true; // toujours émettre la fin
     if (!throttleMs || throttleMs <= 0) return true;
     return now - lastEmitAt >= throttleMs;
   };
 
   const emit = (patch) => {
-    if (typeof onProgress === "function") {
-      try {
-        onProgress({ label, ...patch });
-      } catch (_) {
-        // ne jamais casser FFmpeg si callback bug
-      }
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress({ label, ...patch });
+    } catch (_) {
+      // ne jamais casser FFmpeg si callback bug
     }
   };
 
   const parseHmsToSec = (s) => {
-    // "HH:MM:SS.micro"
     if (!s || typeof s !== "string") return null;
     const m = s.trim().match(/^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d+))?$/);
     if (!m) return null;
-
     const hh = Number(m[1]);
     const mm = Number(m[2]);
     const ss = Number(m[3]);
     const frac = m[4] ? Number("0." + m[4]) : 0;
-
     const sec = hh * 3600 + mm * 60 + ss + frac;
     return Number.isFinite(sec) ? sec : null;
   };
 
   const chooseOutTimeSec = () => {
-    // 1) out_time est le plus fiable
+    // 1) out_time (HH:MM:SS.micro) est le plus fiable
     const secFromOutTime = parseHmsToSec(lastOutTime);
     if (secFromOutTime != null) return secFromOutTime;
 
-    // 2) out_time_ms (souvent microsecondes selon builds FFmpeg)
-    const msRaw = lastOutTimeMsRaw != null ? Number(lastOutTimeMsRaw) : NaN;
-    if (Number.isFinite(msRaw)) {
-      const sec = msRaw / 1_000_000;
-      if (sec >= 0) return sec;
-    }
-
-    // 3) out_time_us (microsecondes)
+    // 2) out_time_us (µs)
     const usRaw = lastOutTimeUsRaw != null ? Number(lastOutTimeUsRaw) : NaN;
     if (Number.isFinite(usRaw)) {
       const sec = usRaw / 1_000_000;
       if (sec >= 0) return sec;
     }
 
+    // 3) out_time_ms (⚠️ FFmpeg: µs malgré le nom)
+    const msRaw = lastOutTimeMsRaw != null ? Number(lastOutTimeMsRaw) : NaN;
+    if (Number.isFinite(msRaw)) {
+      const sec = msRaw / 1_000_000;
+      if (sec >= 0) return sec;
+    }
+
     return null;
+  };
+
+  const computePercent = (sec) => {
+    if (!Number.isFinite(sec) || !Number.isFinite(totalDurationSec) || !totalDurationSec) {
+      return null;
+    }
+    const ratio = sec / totalDurationSec;
+    if (!Number.isFinite(ratio)) return null;
+    // On évite 100% tant qu'on n'a pas progress=end (sauf si on dépasse)
+    const pct = Math.max(0, Math.min(99, Math.round(ratio * 100)));
+    return pct;
   };
 
   const feed = (chunkStr) => {
     leftover += chunkStr;
-    const lines = leftover.split(/\r?\n/);
-    leftover = lines.pop() || "";
+    const arr = leftover.split(/\r?\n/);
+    leftover = arr.pop() || "";
 
-    for (const line of lines) {
+    for (const line of arr) {
       const trimmed = line.trim();
       if (!trimmed) continue;
 
@@ -133,55 +133,57 @@ function createProgressParser({
       const key = trimmed.slice(0, idx).trim();
       const val = trimmed.slice(idx + 1).trim();
 
+      // On garde la trace des champs de temps.
       if (key === "out_time") {
         lastOutTime = val;
         lastProgressEventAt = Date.now();
         continue;
       }
-
+      if (key === "out_time_us") {
+        lastOutTimeUsRaw = val;
+        lastProgressEventAt = Date.now();
+        continue;
+      }
       if (key === "out_time_ms") {
         lastOutTimeMsRaw = val;
         lastProgressEventAt = Date.now();
         continue;
       }
 
-      if (key === "out_time_us") {
-        lastOutTimeUsRaw = val;
-        lastProgressEventAt = Date.now();
-        continue;
-      }
-
+      // On n'émet que sur progress=... (continue/end)
       if (key === "progress") {
         const now = Date.now();
         lastProgressEventAt = now;
 
+        if (!shouldEmitNow(now, val)) continue;
+        lastEmitAt = now;
+
         const tSec = chooseOutTimeSec();
 
-        // ✅ monotone (tolérance 250ms)
         if (tSec != null) {
+          // Monotone: ne jamais reculer (tolérance 250ms)
           if (tSec < lastEmittedSec - 0.25) {
-            // ignore les reculs aberrants
             continue;
           }
           lastEmittedSec = Math.max(lastEmittedSec, tSec);
         }
 
-        // clamp optionnel (pour rester raisonnable si FFmpeg dépasse un peu)
-        const outTimeSec =
-          tSec == null
-            ? null
-            : totalDurationSec && totalDurationSec > 0
-              ? Math.min(lastEmittedSec, totalDurationSec * 3)
-              : lastEmittedSec;
+        const outTimeSec = tSec == null ? null : lastEmittedSec;
 
-        if (shouldEmitNow(now, val)) {
-          lastEmitAt = now;
-          emit({
-            progress: val, // "continue" | "end"
-            outTimeSec,
-            updatedAt: new Date(now).toISOString(),
-          });
-        }
+        // percent optionnel (utile si tu veux éviter un 2e parseur ailleurs)
+        const percent =
+          val === "end"
+            ? 100
+            : outTimeSec == null
+              ? null
+              : computePercent(outTimeSec);
+
+        emit({
+          progress: val, // "continue" | "end"
+          outTimeSec,
+          percent,
+          updatedAt: new Date(now).toISOString(),
+        });
       }
     }
   };
@@ -197,11 +199,13 @@ function createProgressParser({
  * - hard timeout
  * - watchdog d'inactivité
  * - watchdog "stalled progress" si -progress pipe:2 est utilisé
+ * - parsing centralisé du progress (si expectProgress=true)
  *
  * Options:
- * - onProgress: ({label, progress, outTimeSec, updatedAt}) => void
+ * - onProgress: ({label, progress, outTimeSec, percent, updatedAt}) => void
  * - expectProgress: true/false
- * - totalDurationSec: number|null (aide à filtrer des valeurs incohérentes)
+ * - throttleMs: nombre (ms) (sinon env/default)
+ * - totalDurationSec: pour calculer percent
  */
 export function runCmdWithTimeout(cmd, label, options = {}) {
   return new Promise((resolve, reject) => {
@@ -210,11 +214,13 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
 
     const {
       expectProgress = false,
-      onProgress,
+      onProgress = null,
+      throttleMs: throttleMsOpt = null,
       totalDurationSec = null,
     } = options;
 
-    const throttleMs = getProgressThrottleMs();
+    const throttleMs =
+      throttleMsOpt == null ? getProgressThrottleMs() : Number(throttleMsOpt);
 
     // detached sur Linux => permet de tuer tout le groupe (-pid)
     const useDetached = process.platform !== "win32";
@@ -243,6 +249,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
     const killAll = () => {
       try {
         if (useDetached && child.pid) {
+          // Kill process group (important quand shell:true lance un sous-process ffmpeg)
           process.kill(-child.pid, "SIGKILL");
         } else if (child.pid) {
           child.kill("SIGKILL");
@@ -283,7 +290,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       reject(err);
     }, 5000);
 
-    // Watchdog: le progress ne sort plus
+    // Watchdog: le progress ne sort plus (progress=... / out_time_...)
     const progressStallTimer = setInterval(() => {
       if (!expectProgress) return;
 
@@ -295,7 +302,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
         const err = new Error(
           `FFmpeg stalled progress (${label}) après ${Math.round(
             inactivityMs / 1000
-          )}s (plus de progress=... / out_time_*)`
+          )}s (plus de progress=... / out_time_...)`
         );
         err.label = label;
         err.cmd = cmd;
@@ -369,18 +376,17 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
 
 /**
  * Exécute un plan FFmpeg séquentiel.
- * plan = { steps: [{ name, cmd, outputPath, expectProgress?, totalDurationSec? }], outputs: { finalPath } }
+ * plan = { steps: [{ name, cmd, outputPath, expectProgress? }], outputs: { finalPath } }
  *
  * Hook optionnel global: plan.onProgress(patch)
- * - On forward (step + label + progress + outTimeSec + updatedAt)
+ * - On forward (step + label + progress + outTimeSec + percent + updatedAt)
  */
 export async function runFfmpegPlan(plan) {
   if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
     throw new Error("FFmpeg plan invalide (aucune étape).");
   }
 
-  const planOnProgress =
-    typeof plan.onProgress === "function" ? plan.onProgress : null;
+  const planOnProgress = typeof plan.onProgress === "function" ? plan.onProgress : null;
 
   for (const step of plan.steps) {
     const name = step?.name || "step";
@@ -390,15 +396,11 @@ export async function runFfmpegPlan(plan) {
       throw new Error(`Étape FFmpeg invalide: ${name}`);
     }
 
-    console.log(`➡️ [FFmpeg] ${name}`);
-
     await runCmdWithTimeout(cmd, name, {
       expectProgress: !!step.expectProgress,
-      totalDurationSec:
-        typeof step.totalDurationSec === "number" ? step.totalDurationSec : null,
-      onProgress: planOnProgress
-        ? (p) => planOnProgress({ step: name, ...p })
-        : null,
+      totalDurationSec: step.totalDurationSec ?? null,
+      throttleMs: step.throttleMs ?? null,
+      onProgress: planOnProgress ? (p) => planOnProgress({ step: name, ...p }) : null,
     });
 
     if (step.outputPath) {
