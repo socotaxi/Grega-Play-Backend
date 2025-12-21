@@ -1,11 +1,10 @@
-// backend/services/videoProcessing/ffmpegRunner.js
+// /services/videoProcessing/ffmpegRunner.js
 import { spawn } from "child_process";
 
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000; // 20 min
 const DEFAULT_INACTIVITY_MS = 90 * 1000; // 90s (watchdog)
 
 // Throttle pour éviter d'inonder la DB côté caller.
-// (Option A: pas de colonne DB supplémentaire => on pousse un patch stable: outTimeSec + progress + updatedAt)
 const DEFAULT_PROGRESS_THROTTLE_MS = 1200;
 
 function getTimeoutMs() {
@@ -32,34 +31,42 @@ function tail(str, max = 6000) {
   return s.slice(-max);
 }
 
-function safeNumber(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
 /**
  * Parse les lignes de progress FFmpeg (quand -progress pipe:2).
  * Format typique:
- * out_time_ms=12345678   (⚠️ en réalité ce champ est en MICROsecondes)
+ * out_time=00:00:12.345678 (le plus fiable quand présent)
+ * out_time_ms=12345678     (⚠️ souvent microsecondes selon builds FFmpeg)
+ * out_time_us=12345678     (microsecondes)
  * progress=continue|end
  *
- * PATCH Option A:
- * - On stocke out_time_ms (microsecondes) et on n'émet qu'au moment de "progress=..."
- * - outTimeSec = out_time_ms / 1e6
- * - Throttle intégré (pour limiter les callbacks)
+ * Patch:
+ * - Priorité: out_time (HH:MM:SS.xxx)
+ * - Fallback: out_time_ms / 1e6
+ * - Fallback: out_time_us / 1e6
+ * - Monotone: ne jamais reculer (tolérance 250ms)
+ * - Throttle intégré (limite les callbacks)
  */
-function createProgressParser({ label, onProgress, throttleMs }) {
+function createProgressParser({
+  label,
+  onProgress,
+  throttleMs,
+  totalDurationSec = null,
+}) {
   let leftover = "";
 
-  // FFmpeg: out_time_ms = microseconds
-  let lastOutTimeUs = null;
+  let lastOutTime = null; // ex: "00:00:12.345678"
+  let lastOutTimeMsRaw = null; // ex: "12345678"
+  let lastOutTimeUsRaw = null; // ex: "12345678"
+
+  // ✅ monotone: ne jamais reculer
+  let lastEmittedSec = 0;
 
   let lastProgressEventAt = Date.now();
 
   // throttle
   let lastEmitAt = 0;
   const shouldEmitNow = (now, progressValue) => {
-    if (progressValue === "end") return true; // toujours émettre la fin
+    if (progressValue === "end") return true;
     if (!throttleMs || throttleMs <= 0) return true;
     return now - lastEmitAt >= throttleMs;
   };
@@ -72,6 +79,43 @@ function createProgressParser({ label, onProgress, throttleMs }) {
         // ne jamais casser FFmpeg si callback bug
       }
     }
+  };
+
+  const parseHmsToSec = (s) => {
+    // "HH:MM:SS.micro"
+    if (!s || typeof s !== "string") return null;
+    const m = s.trim().match(/^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d+))?$/);
+    if (!m) return null;
+
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    const ss = Number(m[3]);
+    const frac = m[4] ? Number("0." + m[4]) : 0;
+
+    const sec = hh * 3600 + mm * 60 + ss + frac;
+    return Number.isFinite(sec) ? sec : null;
+  };
+
+  const chooseOutTimeSec = () => {
+    // 1) out_time est le plus fiable
+    const secFromOutTime = parseHmsToSec(lastOutTime);
+    if (secFromOutTime != null) return secFromOutTime;
+
+    // 2) out_time_ms (souvent microsecondes selon builds FFmpeg)
+    const msRaw = lastOutTimeMsRaw != null ? Number(lastOutTimeMsRaw) : NaN;
+    if (Number.isFinite(msRaw)) {
+      const sec = msRaw / 1_000_000;
+      if (sec >= 0) return sec;
+    }
+
+    // 3) out_time_us (microsecondes)
+    const usRaw = lastOutTimeUsRaw != null ? Number(lastOutTimeUsRaw) : NaN;
+    if (Number.isFinite(usRaw)) {
+      const sec = usRaw / 1_000_000;
+      if (sec >= 0) return sec;
+    }
+
+    return null;
   };
 
   const feed = (chunkStr) => {
@@ -89,12 +133,21 @@ function createProgressParser({ label, onProgress, throttleMs }) {
       const key = trimmed.slice(0, idx).trim();
       const val = trimmed.slice(idx + 1).trim();
 
+      if (key === "out_time") {
+        lastOutTime = val;
+        lastProgressEventAt = Date.now();
+        continue;
+      }
+
       if (key === "out_time_ms") {
-        const us = safeNumber(val);
-        if (us !== null) {
-          lastOutTimeUs = us;
-          lastProgressEventAt = Date.now();
-        }
+        lastOutTimeMsRaw = val;
+        lastProgressEventAt = Date.now();
+        continue;
+      }
+
+      if (key === "out_time_us") {
+        lastOutTimeUsRaw = val;
+        lastProgressEventAt = Date.now();
         continue;
       }
 
@@ -102,13 +155,28 @@ function createProgressParser({ label, onProgress, throttleMs }) {
         const now = Date.now();
         lastProgressEventAt = now;
 
+        const tSec = chooseOutTimeSec();
+
+        // ✅ monotone (tolérance 250ms)
+        if (tSec != null) {
+          if (tSec < lastEmittedSec - 0.25) {
+            // ignore les reculs aberrants
+            continue;
+          }
+          lastEmittedSec = Math.max(lastEmittedSec, tSec);
+        }
+
+        // clamp optionnel (pour rester raisonnable si FFmpeg dépasse un peu)
         const outTimeSec =
-          lastOutTimeUs === null ? null : Math.max(0, lastOutTimeUs / 1_000_000);
+          tSec == null
+            ? null
+            : totalDurationSec && totalDurationSec > 0
+              ? Math.min(lastEmittedSec, totalDurationSec * 3)
+              : lastEmittedSec;
 
         if (shouldEmitNow(now, val)) {
           lastEmitAt = now;
           emit({
-            // Option A: payload minimal et stable
             progress: val, // "continue" | "end"
             outTimeSec,
             updatedAt: new Date(now).toISOString(),
@@ -129,11 +197,11 @@ function createProgressParser({ label, onProgress, throttleMs }) {
  * - hard timeout
  * - watchdog d'inactivité
  * - watchdog "stalled progress" si -progress pipe:2 est utilisé
- * - parse optionnel de out_time_ms / progress=end
  *
  * Options:
  * - onProgress: ({label, progress, outTimeSec, updatedAt}) => void
- * - expectProgress: true/false (si true, active le watchdog d'avancement)
+ * - expectProgress: true/false
+ * - totalDurationSec: number|null (aide à filtrer des valeurs incohérentes)
  */
 export function runCmdWithTimeout(cmd, label, options = {}) {
   return new Promise((resolve, reject) => {
@@ -141,8 +209,9 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
     const inactivityMs = getInactivityMs();
 
     const {
-      onProgress,
       expectProgress = false,
+      onProgress,
+      totalDurationSec = null,
     } = options;
 
     const throttleMs = getProgressThrottleMs();
@@ -168,12 +237,12 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       label,
       onProgress,
       throttleMs,
+      totalDurationSec,
     });
 
     const killAll = () => {
       try {
         if (useDetached && child.pid) {
-          // Kill process group (important quand shell:true lance un sous-process ffmpeg)
           process.kill(-child.pid, "SIGKILL");
         } else if (child.pid) {
           child.kill("SIGKILL");
@@ -214,7 +283,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
       reject(err);
     }, 5000);
 
-    // Watchdog: le progress ne sort plus (progress=... / out_time_ms...)
+    // Watchdog: le progress ne sort plus
     const progressStallTimer = setInterval(() => {
       if (!expectProgress) return;
 
@@ -226,7 +295,7 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
         const err = new Error(
           `FFmpeg stalled progress (${label}) après ${Math.round(
             inactivityMs / 1000
-          )}s (plus de progress=... / out_time_ms)`
+          )}s (plus de progress=... / out_time_*)`
         );
         err.label = label;
         err.cmd = cmd;
@@ -300,10 +369,9 @@ export function runCmdWithTimeout(cmd, label, options = {}) {
 
 /**
  * Exécute un plan FFmpeg séquentiel.
- * plan = { steps: [{ name, cmd, outputPath, expectProgress? }], outputs: { finalPath } }
+ * plan = { steps: [{ name, cmd, outputPath, expectProgress?, totalDurationSec? }], outputs: { finalPath } }
  *
  * Hook optionnel global: plan.onProgress(patch)
- * PATCH Option A:
  * - On forward (step + label + progress + outTimeSec + updatedAt)
  */
 export async function runFfmpegPlan(plan) {
@@ -326,6 +394,8 @@ export async function runFfmpegPlan(plan) {
 
     await runCmdWithTimeout(cmd, name, {
       expectProgress: !!step.expectProgress,
+      totalDurationSec:
+        typeof step.totalDurationSec === "number" ? step.totalDurationSec : null,
       onProgress: planOnProgress
         ? (p) => planOnProgress({ step: name, ...p })
         : null,
