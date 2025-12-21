@@ -898,7 +898,8 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
   const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
 
   let filter;
-  if (coreHasAudio) {
+
+    if (coreHasAudio) {
     filter =
   `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
   `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
@@ -924,11 +925,14 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
 
   }
 
+const cleanFilter = filter.trim().replace(/;+\s*$/, "");
+
+
   const cmd =
     `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
-    `${silenceInput} -filter_complex "${filter}" ` +
-    `-map "[v]" -map "[a]" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
+    `${silenceInput} -filter_complex "${cleanFilter}" ` +
+    `-map "[v1]" -map 1:a? -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
 
   console.log("➡️ FFmpeg intro/outro:", cmd);
   await runFfmpegWithProgress(cmd, {
@@ -1021,13 +1025,6 @@ async function addIntroOutroWithMusic(
 
   logJson("✅ Intro/Outro + music OK", { outputPath });
 }
-
-
-
-
-
-// (removed duplicate addIntroOutroNoMusic definition)
-
 
 
 
