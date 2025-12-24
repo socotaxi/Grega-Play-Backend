@@ -214,6 +214,9 @@ function getPublicSiteUrl(req) {
 const apiKeyMiddleware = (req, res, next) => {
   if (req.method === "OPTIONS") return next();
 
+  // ✅ Exception: routes publiques (pas de clé API)
+  if (req.originalUrl.startsWith("/api/public/")) return next();
+
   const incomingKey = req.headers["x-api-key"];
   const expectedKey = process.env.INTERNAL_API_KEY;
 
@@ -462,7 +465,9 @@ app.get("/og/event/:public_code.png", async (req, res) => {
   </g>
 </svg>`;
 
-    const pngBuffer = await sharp(Buffer.from(svg)).png({ quality: 90 }).toBuffer();
+    const pngBuffer = await sharp(Buffer.from(svg))
+      .png({ quality: 90 })
+      .toBuffer();
 
     res.set("Content-Type", "image/png");
     res.set("Cache-Control", "public, max-age=3600"); // 1h
@@ -500,11 +505,7 @@ app.get("/share/e/:public_code", async (req, res) => {
       (event.description || "").trim() ||
       "Participe à cet événement et ajoute ta vidéo souvenir.";
 
-    // ✅ Priorité à l'image dynamique par événement
-    // (si tu veux forcer cover_url uploadée, mets cover_url en priorité)
-    const ogImage = siteUrl
-      ? `${siteUrl}/og/event/${public_code}.png`
-      : "";
+    const ogImage = siteUrl ? `${siteUrl}/og/event/${public_code}.png` : "";
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
@@ -517,14 +518,20 @@ app.get("/share/e/:public_code", async (req, res) => {
 
   <meta property="og:title" content="${escapeAttr(ogTitle)}" />
   <meta property="og:description" content="${escapeAttr(ogDesc)}" />
-  ${ogImage ? `<meta property="og:image" content="${escapeAttr(ogImage)}" />` : ""}
+  ${
+    ogImage
+      ? `<meta property="og:image" content="${escapeAttr(ogImage)}" />`
+      : ""
+  }
   <meta property="og:url" content="${escapeAttr(appUrl)}" />
   <meta property="og:type" content="website" />
 
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="${escapeAttr(ogTitle)}" />
   <meta name="twitter:description" content="${escapeAttr(ogDesc)}" />
-  ${ogImage ? `<meta name="twitter:image" content="${escapeAttr(ogImage)}" />` : ""}
+  ${
+    ogImage ? `<meta name="twitter:image" content="${escapeAttr(ogImage)}" />` : ""
+  }
 
   <meta http-equiv="refresh" content="0;url=${escapeAttr(appUrl)}" />
 </head>
@@ -538,9 +545,92 @@ app.get("/share/e/:public_code", async (req, res) => {
   }
 });
 
-// (optionnel) si tu utilises ces routes sans clé API, déplace-les avant /api
-// app.use("/notifications", notificationsRouter);
-// app.use("/auth/whatsapp", whatsappAuthRoutes);
+// ------------------------------------------------------
+// 🌍 ROUTES PUBLIQUES
+// ------------------------------------------------------
+const publicRouter = express.Router();
+
+// GET /api/public/final-video/:public_code
+publicRouter.get("/final-video/:public_code", async (req, res) => {
+  try {
+    const { public_code } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select("title, final_video_path")
+      .eq("public_code", public_code)
+      .single();
+
+    if (error || !event || !event.final_video_path) {
+      return res.status(404).json({ error: "Vidéo finale introuvable" });
+    }
+
+    // Si tu stockes déjà une URL complète en DB
+    if (event.final_video_path.startsWith("http")) {
+      return res.status(200).json({
+        title: event.title || "Vidéo finale",
+        finalVideoUrl: event.final_video_path,
+      });
+    }
+
+    // ---------------------------------------------------------
+    // ✅ FIX: final_videos est un DOSSIER dans le bucket "videos"
+    // ---------------------------------------------------------
+    let objectPath = String(event.final_video_path || "").trim();
+
+    // Cas 1: DB stocke "events/<id>/final.mp4" -> on préfixe "final_videos/"
+    if (objectPath.startsWith("events/")) {
+      objectPath = `final_videos/${objectPath}`;
+    }
+
+    // Cas 2: DB stocke déjà "final_videos/..." -> on laisse tel quel
+    objectPath = objectPath.replace(/^\/+/, "");
+
+    const dir = objectPath.split("/").slice(0, -1).join("/");
+    const filename = objectPath.split("/").pop();
+
+    // Vérifier existence dans bucket "videos"
+    const { data: listed, error: listErr } = await supabase.storage
+      .from("videos")
+      .list(dir, { limit: 100 });
+
+    if (listErr) {
+      console.error("❌ Storage list error:", listErr);
+    } else {
+      const exists = (listed || []).some((f) => f.name === filename);
+      console.log("🔎 Storage check:", { dir, filename, exists, objectPath });
+
+      if (!exists) {
+        return res.status(404).json({
+          error: "Fichier vidéo introuvable dans le bucket videos",
+          debug: { objectPath },
+        });
+      }
+    }
+
+    // Signer dans bucket "videos"
+    const { data: signed, error: signErr } = await supabase.storage
+      .from("videos")
+      .createSignedUrl(objectPath, 60 * 60); // 1h
+
+    if (signErr || !signed?.signedUrl) {
+      console.error("❌ Signed URL error:", signErr);
+      return res
+        .status(500)
+        .json({ error: "Impossible de générer le lien vidéo" });
+    }
+
+    return res.status(200).json({
+      title: event.title || "Vidéo finale",
+      finalVideoUrl: signed.signedUrl,
+    });
+  } catch (e) {
+    console.error("❌ public final-video error:", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+app.use("/api/public", publicRouter);
 
 // ------------------------------------------------------
 // Toutes les routes en /api nécessitent une clé API
@@ -726,10 +816,18 @@ app.delete("/api/events/:eventId", async (req, res) => {
       if (parsed) filesToRemove.push({ bucket: parsed.bucket, path: parsed.path });
     }
 
+    // ✅ vidéo finale : final_videos est un dossier dans bucket "videos"
     if (event.final_video_path) {
+      let finalPath = String(event.final_video_path || "").trim();
+
+      if (finalPath.startsWith("events/")) {
+        finalPath = `final_videos/${finalPath}`;
+      }
+      finalPath = finalPath.replace(/^\/+/, "");
+
       filesToRemove.push({
-        bucket: "final-videos",
-        path: event.final_video_path,
+        bucket: "videos",
+        path: finalPath,
       });
     }
 
