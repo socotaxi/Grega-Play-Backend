@@ -1027,9 +1027,13 @@ async function applyWatermark(inputPath, outputPath, { jobId, progressBase = 85,
     return;
   }
 
+// ------------------------------------------------------
+// watermark 
+// ------------------------------------------------------
+
   const dur = await getVideoDurationSafe(inputPath, "watermark_input");
 
-  const filterComplex = `[1:v]scale=150:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto[v]`;
+  const filterComplex = `[1:v]scale=90:-1[wm];[0:v][wm]overlay=W-w-20:H-h-20:format=auto[v]`;
 
   const cleanFilterComplex = filterComplex.replace(/\s*\n\s*/g, ' ').trim();
 

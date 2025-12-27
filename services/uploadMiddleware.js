@@ -26,18 +26,16 @@ const storage = multer.diskStorage({
     cb(null, UPLOAD_DIR);
   },
   filename: (req, file, cb) => {
-    const uniqueSuffix =
-      Date.now() + "-" + Math.round(Math.random() * 1e9);
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
     const ext = path.extname(file.originalname || "");
     cb(null, `${uniqueSuffix}${ext}`);
   },
 });
 
 // Instance Multer exportée
+// ⚠️ Important: on ne met PAS de limite globale ici.
+// Les limites sont gérées par les "capabilities" + validation côté frontend,
+// avec une exception admin (edhemrombhot@gmail.com) qui ne doit pas être limité.
 export const upload = multer({
   storage,
-  limits: {
-    // Limite de taille (ex : 1 Go, à ajuster)
-    fileSize: 1024 * 1024 * 1024,
-  },
 });

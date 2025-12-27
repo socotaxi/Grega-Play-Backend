@@ -200,6 +200,14 @@ async function notifyNewFinalVideo() {
   return;
 }
 
+
+const ADMIN_EMAIL = "edhemrombhot@gmail.com";
+
+function isAdminUploader(participantEmail) {
+  return String(participantEmail || "").toLowerCase() === ADMIN_EMAIL;
+}
+
+
 // ------------------------------------------------------
 // ✅ CONTROLLERS
 // ------------------------------------------------------
@@ -359,15 +367,32 @@ export async function uploadVideo(req, res) {
 
     const duration = await getVideoDuration(file.path);
 
-    if (duration && duration > 30) {
-      await logRejectedUpload({ req, reason: "Durée vidéo > 30 secondes", file, eventId, participantName, duration });
+    const isAdmin = isAdminUploader(participantEmail);
 
-      if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+if (!isAdmin && duration && duration > 30) {
+  await logRejectedUpload({
+    req,
+    reason: "Durée vidéo > 30 secondes",
+    file,
+    eventId,
+    participantName,
+    duration,
+  });
 
-      return res.status(400).json({
-        error: "La vidéo dépasse la durée maximale autorisée (30 secondes). Merci d'envoyer une vidéo plus courte.",
-      });
-    }
+  if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+
+  return res.status(400).json({
+    error: "La vidéo dépasse la durée maximale autorisée (30 secondes). Merci d'envoyer une vidéo plus courte.",
+  });
+}
+
+if (isAdmin) {
+  console.log("🟩 ADMIN upload bypass duration limit", {
+    participantEmail,
+    duration,
+    size: file.size,
+  });
+}
 
     const compressedDir = path.join(tmp, "compressed");
     if (!fs.existsSync(compressedDir)) fs.mkdirSync(compressedDir, { recursive: true });
