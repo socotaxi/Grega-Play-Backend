@@ -1308,7 +1308,10 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
       .update({ status: "done", final_video_url: finalVideoUrl, final_video_path: finalStoragePath })
       .eq("id", eventId);
 
-    if (updateErr) throw new Error("Erreur mise à jour event (final_video_url).");
+    if (updateErr) {
+      console.error("❌ updateErr details:", JSON.stringify(updateErr));
+      throw new Error(`Erreur mise à jour event (final_video_url): ${updateErr.message || updateErr.code || JSON.stringify(updateErr)}`);
+    }
 
     await jobUpdate({ status: "done", step: "done", progress: 100, message: "Vidéo générée", error: null });
     setRuntime(jobId, { step: "done", percent: 100 });
