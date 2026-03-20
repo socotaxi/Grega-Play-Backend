@@ -688,7 +688,7 @@ app.post("/api/events/:eventId/remind", async (req, res) => {
   try {
     const { data: event, error: eventError } = await supabase
       .from("events")
-      .select("id, title, description, deadline, user_id")
+      .select("id, title, description, deadline, user_id, public_code")
       .eq("id", eventId)
       .single();
 
@@ -719,14 +719,22 @@ app.post("/api/events/:eventId/remind", async (req, res) => {
       });
     }
 
-    await emailService.sendReminderToParticipants({
+    const publicSiteUrl = process.env.PUBLIC_SITE_URL || "";
+    const eventLink = event.public_code
+      ? `${publicSiteUrl}/e/${event.public_code}`
+      : publicSiteUrl;
+
+    const { sent, failed } = await emailService.sendReminderToParticipants({
       event,
       participants: participantsToRemind,
+      eventLink,
     });
 
     return res.status(200).json({
       message: "Emails de relance envoyés aux participants en attente.",
       count: participantsToRemind.length,
+      sent,
+      failed,
     });
   } catch (err) {
     console.error("❌ Erreur /api/events/:eventId/remind:", err);

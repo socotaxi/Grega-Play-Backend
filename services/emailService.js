@@ -291,7 +291,144 @@ Vous recevez cet email car ${safeOrganizerName} vous a invité(e) sur Grega Play
   return sendMail({ to, subject, html, text });
 }
 
+/**
+ * Emails de rappel aux participants qui n'ont pas encore soumis de vidéo
+ */
+async function sendReminderToParticipants({ event, participants, eventLink }) {
+  const safeTitle = event.title || "l'événement";
+  const formattedDeadline = event.deadline
+    ? new Date(event.deadline).toLocaleDateString("fr-FR", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      })
+    : null;
+
+  const results = await Promise.allSettled(
+    participants.map((participant) => {
+      const safeName = participant.name || "vous";
+
+      const subject = `Rappel : n'oubliez pas de soumettre votre vidéo pour "${safeTitle}"`;
+
+      const text = `
+Bonjour ${safeName},
+
+Vous avez été invité(e) à participer à l'événement "${safeTitle}" sur Grega Play et nous n'avons pas encore reçu votre vidéo.
+
+${formattedDeadline ? `Date limite : ${formattedDeadline}\n` : ""}
+Soumettez votre vidéo dès maintenant :
+${eventLink}
+
+L'équipe Grega Play
+`.trim();
+
+      const html = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Rappel Grega Play</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f4f7;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f7;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+
+          <!-- Header -->
+          <tr>
+            <td style="background:linear-gradient(135deg,#6c47ff 0%,#a855f7 100%);padding:40px 48px;text-align:center;">
+              <h1 style="margin:0;color:#ffffff;font-size:28px;font-weight:700;letter-spacing:-0.5px;">Grega Play</h1>
+              <p style="margin:8px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">Together, we create the moment</p>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:40px 48px 0;">
+              <p style="margin:0 0 8px;color:#999;font-size:13px;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Rappel</p>
+              <h2 style="margin:0 0 16px;color:#1a1a2e;font-size:22px;font-weight:700;line-height:1.3;">
+                Votre vidéo pour &laquo;&nbsp;${safeTitle}&nbsp;&raquo; nous attend encore !
+              </h2>
+              <p style="margin:0;color:#666;font-size:15px;line-height:1.7;">
+                Bonjour ${safeName},<br/><br/>
+                Vous avez été invité(e) à participer à cet événement vidéo collaboratif et nous n'avons pas encore reçu votre contribution. Il n'est pas trop tard !
+              </p>
+            </td>
+          </tr>
+
+          <!-- Event card -->
+          <tr>
+            <td style="padding:32px 48px 0;">
+              <table width="100%" cellpadding="0" cellspacing="0" style="background:#f7f5ff;border:1px solid #e4dcff;border-radius:10px;overflow:hidden;">
+                <tr>
+                  <td style="background:#6c47ff;width:5px;padding:0;">&nbsp;</td>
+                  <td style="padding:20px 24px;">
+                    <p style="margin:0 0 4px;color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Événement</p>
+                    <h3 style="margin:0 0 10px;color:#1a1a2e;font-size:17px;font-weight:700;">${safeTitle}</h3>
+                    ${formattedDeadline ? `<p style="margin:0;font-size:13px;color:#6c47ff;font-weight:600;">Date limite : ${formattedDeadline}</p>` : ""}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- CTA -->
+          <tr>
+            <td style="padding:36px 48px 0;text-align:center;">
+              <table cellpadding="0" cellspacing="0" style="margin:0 auto;">
+                <tr>
+                  <td style="background:linear-gradient(135deg,#6c47ff 0%,#a855f7 100%);border-radius:8px;">
+                    <a href="${eventLink}" style="display:inline-block;padding:16px 44px;color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;border-radius:8px;">
+                      Soumettre ma vidéo →
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Fallback link -->
+          <tr>
+            <td style="padding:24px 48px 0;">
+              <hr style="border:none;border-top:1px solid #ebebf0;margin:0 0 16px;"/>
+              <p style="margin:0 0 6px;color:#aaa;font-size:12px;">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :</p>
+              <p style="margin:0;word-break:break-all;">
+                <a href="${eventLink}" style="color:#6c47ff;font-size:12px;text-decoration:none;">${eventLink}</a>
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:#f9f9fb;padding:24px 48px;text-align:center;border-top:1px solid #ebebf0;margin-top:24px;">
+              <p style="margin:0;color:#aaa;font-size:12px;line-height:1.7;">
+                Vous recevez cet email car vous avez été invité(e) à un événement sur <strong>Grega Play</strong>.<br/>
+                Si vous ne souhaitez plus recevoir ces rappels, ignorez cet email.
+              </p>
+              <p style="margin:12px 0 0;color:#ccc;font-size:11px;">© 2026 Grega Play — Tous droits réservés</p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+      return sendMail({ to: participant.email, subject, html, text });
+    })
+  );
+
+  const sent = results.filter((r) => r.status === "fulfilled").length;
+  const failed = results.filter((r) => r.status === "rejected").length;
+  console.log(`📧 Rappels envoyés : ${sent} réussis, ${failed} échoués`);
+  return { sent, failed };
+}
+
 export default {
   sendMail,
   sendInvitationEmail,
+  sendReminderToParticipants,
 };

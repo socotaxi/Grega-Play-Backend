@@ -13,6 +13,12 @@ import processVideo, { getVideoJobStatus } from "../services/processVideo.js";
 import { computeEventCapabilities } from "../services/capabilitiesService.js";
 import { createVideoJob, updateVideoJob, getVideoJob } from "../services/db/videoJobs.repo.js";
 import { resolveEffectivePreset } from "../services/presetResolver.js";
+import {
+  notifyEventParticipants,
+  notifyUser,
+  buildNewVideoPayload,
+  buildFinalVideoPayload,
+} from "../services/eventNotifier.js";
 
 global.fetch = fetch;
 
@@ -195,10 +201,6 @@ function getBucketAndPathFromPublicUrl(publicUrl) {
   }
 }
 
-// stubs
-async function notifyNewFinalVideo() {
-  return;
-}
 
 
 const ADMIN_EMAIL = "edhemrombhot@gmail.com";
@@ -445,6 +447,14 @@ if (isAdmin) {
         .eq("id", participant.id);
     }
 
+    // Notifie le créateur de l'événement qu'une nouvelle vidéo a été soumise
+    if (!isCreator && event.user_id) {
+      notifyUser(
+        event.user_id,
+        buildNewVideoPayload(event.title, participantName, eventId)
+      ).catch(() => {});
+    }
+
     return res.status(200).json({
       message: "Vidéo téléchargée et compressée avec succès.",
       video: insertedVideo,
@@ -618,11 +628,12 @@ export async function processVideoSync(req, res) {
       });
     }
 
-    try {
-      await notifyNewFinalVideo(event, finalVideoUrl);
-    } catch (notifyErr) {
-      console.error("⚠️ Vidéo générée mais notifications en erreur:", notifyErr);
-    }
+    notifyEventParticipants(
+      eventId,
+      buildFinalVideoPayload(event.title, eventId, finalVideoUrl)
+    ).catch((notifyErr) => {
+      console.error("⚠️ Vidéo générée mais notifications en erreur:", notifyErr?.message);
+    });
 
     await updateVideoJob(job.id, {
       status: "done",
@@ -745,6 +756,13 @@ export async function processVideoAsync(req, res) {
           final_video_url: finalVideoUrl,
           finished_at: new Date().toISOString(),
           error: null,
+        });
+
+        notifyEventParticipants(
+          eventId,
+          buildFinalVideoPayload(event.title, eventId, finalVideoUrl)
+        ).catch((notifyErr) => {
+          console.error("⚠️ Async job: notifications en erreur:", notifyErr?.message);
         });
       } catch (e) {
         console.error("❌ Job montage failed:", e);
