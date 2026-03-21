@@ -1,77 +1,99 @@
 // services/emailService.js
+import nodemailer from "nodemailer";
 import sgMail from "@sendgrid/mail";
 
 const {
+  SMTP_HOST,
+  SMTP_PORT,
+  SMTP_USER,
+  SMTP_PASSWORD,
+  SMTP_FROM_EMAIL,
+  SMTP_FROM_NAME,
   SENDGRID_API_KEY,
   SENDGRID_FROM_EMAIL,
   SENDGRID_FROM_NAME,
   GREGAPLAY_LOGO_URL,
 } = process.env;
 
+const hasSmtp = !!SMTP_HOST && !!SMTP_USER && !!SMTP_PASSWORD;
 const hasSendgrid = !!SENDGRID_API_KEY && !!SENDGRID_FROM_EMAIL;
 
-console.log("📨 SendGrid config chargée:", {
-  hasApiKey: !!SENDGRID_API_KEY,
-  fromEmail: SENDGRID_FROM_EMAIL,
-  fromName: SENDGRID_FROM_NAME,
-  hasLogo: !!GREGAPLAY_LOGO_URL,
-});
+let smtpTransporter = null;
 
-if (hasSendgrid) {
+if (hasSmtp) {
+  smtpTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT) || 587,
+    secure: Number(SMTP_PORT) === 465,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASSWORD,
+    },
+  });
+  console.log("📨 SMTP config chargée:", {
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    user: SMTP_USER,
+  });
+} else if (hasSendgrid) {
   sgMail.setApiKey(SENDGRID_API_KEY);
+  console.log("📨 SendGrid config chargée:", {
+    fromEmail: SENDGRID_FROM_EMAIL,
+    fromName: SENDGRID_FROM_NAME,
+  });
 } else {
   console.warn(
-    "⚠️ SendGrid non configuré (SENDGRID_API_KEY ou SENDGRID_FROM_EMAIL manquant). " +
+    "⚠️ Aucun service email configuré (ni SMTP ni SendGrid). " +
       "Les emails ne seront pas envoyés, mais le backend reste en ligne."
   );
 }
 
 /**
- * Envoi générique d'email via SendGrid
+ * Envoi générique d'email via SMTP (Brevo) ou SendGrid en fallback
  */
 async function sendMail({ to, subject, html, text }) {
-  if (!hasSendgrid) {
-    console.warn(
-      "⏭️ Email ignoré (SendGrid non configuré) ->",
-      subject,
-      "->",
-      to
-    );
+  if (hasSmtp) {
+    const fromEmail = SMTP_FROM_EMAIL || SMTP_USER;
+    const fromName = SMTP_FROM_NAME || "Grega Play";
+    try {
+      const info = await smtpTransporter.sendMail({
+        from: `"${fromName}" <${fromEmail}>`,
+        to,
+        subject,
+        text,
+        html,
+      });
+      console.log("📧 Email envoyé via SMTP →", to, "messageId:", info.messageId);
+      return info;
+    } catch (error) {
+      console.error("❌ Erreur SMTP lors de l'envoi d'email:", error.message);
+    }
     return;
   }
 
-  const fromName = SENDGRID_FROM_NAME || "Grega Play";
-
-  const msg = {
-    to,
-    from: {
-      email: SENDGRID_FROM_EMAIL,
-      name: fromName,
-    },
-    subject,
-    text,
-    html,
-  };
-
-  try {
-    const [response] = await sgMail.send(msg);
-    console.log(
-      "📧 Email envoyé via SendGrid →",
+  if (hasSendgrid) {
+    const fromName = SENDGRID_FROM_NAME || "Grega Play";
+    const msg = {
       to,
-      "statusCode:",
-      response?.statusCode
-    );
-    return response;
-  } catch (error) {
-    console.error(
-      "❌ Erreur SendGrid lors de l'envoi d'email:",
-      error.message
-    );
-    if (error.response) {
-      console.error("📩 Détails SendGrid:", error.response.body);
+      from: { email: SENDGRID_FROM_EMAIL, name: fromName },
+      subject,
+      text,
+      html,
+    };
+    try {
+      const [response] = await sgMail.send(msg);
+      console.log("📧 Email envoyé via SendGrid →", to, "statusCode:", response?.statusCode);
+      return response;
+    } catch (error) {
+      console.error("❌ Erreur SendGrid lors de l'envoi d'email:", error.message);
+      if (error.response) {
+        console.error("📩 Détails SendGrid:", error.response.body);
+      }
     }
-    // On ne lève PAS d'erreur ici pour ne pas faire crasher le serveur
+    return;
   }
+
+  console.warn("⏭️ Email ignoré (aucun service configuré) ->", subject, "->", to);
 }
 
 /**
