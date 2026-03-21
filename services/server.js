@@ -652,6 +652,9 @@ app.use("/api/billing", billingRoutes);
 // ✅ vidéos centralisées (upload/process/process-async/jobs)
 app.use("/api/videos", videosRoutes);
 
+// 🔔 notifications push
+app.use("/api/notifications", notificationsRouter);
+
 // ------------------------------------------------------
 // 🧩 Helper : extraire bucket + path depuis une URL publique Supabase
 // (utilisé ici pour la suppression complète d'événement)
