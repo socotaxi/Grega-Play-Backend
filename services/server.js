@@ -488,7 +488,7 @@ app.get("/share/e/:public_code", async (req, res) => {
 
     const { data: event, error } = await supabase
       .from("events")
-      .select("title, description, theme, public_code, cover_url, media_url")
+      .select("title, description, theme, public_code, media_url")
       .eq("public_code", public_code)
       .single();
 
@@ -511,10 +511,7 @@ app.get("/share/e/:public_code", async (req, res) => {
     // Utilise la vraie photo de l'événement si c'est une image, sinon l'image générée
     const isImageUrl = (url) =>
       /\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i.test(url || "");
-    const eventPhoto =
-      isImageUrl(event.media_url) ? event.media_url :
-      isImageUrl(event.cover_url) ? event.cover_url :
-      null;
+    const eventPhoto = isImageUrl(event.media_url) ? event.media_url : null;
     const ogImage = eventPhoto || (siteUrl ? `${siteUrl}/og/event/${public_code}.png` : "");
 
     res.set("Content-Type", "text/html; charset=utf-8");
