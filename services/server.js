@@ -562,15 +562,31 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
       .single();
 
     if (error || !event) {
+      console.error("❌ public final-video: event not found", { public_code, error });
       return res.status(404).json({ message: "Événement introuvable" });
     }
 
+    console.log("🔎 public final-video DB result:", {
+      public_code,
+      title: event.title,
+      final_video_url_type: typeof event.final_video_url,
+      final_video_url: event.final_video_url,
+      final_video_path: event.final_video_path,
+    });
+
+    // Extraire l'URL depuis final_video_url (peut être une string ou un objet { videoUrl: "..." })
+    const rawFinalUrl = event.final_video_url;
+    const resolvedFinalUrl =
+      typeof rawFinalUrl === "string"
+        ? rawFinalUrl
+        : rawFinalUrl?.videoUrl || null;
+
     // Priorité 1 : final_video_url déjà calculée (URL publique ou signée)
-    if (event.final_video_url?.startsWith("http")) {
+    if (resolvedFinalUrl?.startsWith("http")) {
       return res.status(200).json({
         title: event.title || "Vidéo finale",
         description: event.description || null,
-        finalVideoUrl: event.final_video_url,
+        finalVideoUrl: resolvedFinalUrl,
       });
     }
 
