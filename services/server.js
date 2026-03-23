@@ -497,8 +497,16 @@ app.get("/share/e/:public_code", async (req, res) => {
       return res.status(404).send("Not found");
     }
 
-    const siteUrl = getPublicSiteUrl(req); // PUBLIC_SITE_URL recommandé
+    // siteUrl = URL du frontend (pour la redirection vers l'app)
+    const siteUrl = getPublicSiteUrl(req);
     const appUrl = siteUrl ? `${siteUrl}/e/${public_code}` : `/e/${public_code}`;
+
+    // backendUrl = URL de CE serveur (pour les routes /og/event/*.png)
+    const backendProto = ((req.headers["x-forwarded-proto"] || req.protocol || "https") + "")
+      .split(",")[0].trim();
+    const backendHost = ((req.headers["x-forwarded-host"] || req.headers.host || "") + "")
+      .split(",")[0].trim();
+    const backendUrl = backendHost ? `${backendProto}://${backendHost}` : "";
 
     const ogTitle = `🎉 ${event.title || "Événement"} – Grega Play`;
 
@@ -508,11 +516,12 @@ app.get("/share/e/:public_code", async (req, res) => {
       "Participe à cet événement et ajoute ta vidéo souvenir.";
     const ogDesc = rawDesc.length > 200 ? rawDesc.slice(0, 197) + "…" : rawDesc;
 
-    // Utilise la vraie photo de l'événement si c'est une image, sinon l'image générée
+    // Utilise la vraie photo de l'événement si c'est une image,
+    // sinon l'image générée sur CE backend (pas le frontend)
     const isImageUrl = (url) =>
       /\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i.test(url || "");
     const eventPhoto = isImageUrl(event.media_url) ? event.media_url : null;
-    const ogImage = eventPhoto || (siteUrl ? `${siteUrl}/og/event/${public_code}.png` : "");
+    const ogImage = eventPhoto || (backendUrl ? `${backendUrl}/og/event/${public_code}.png` : "");
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
