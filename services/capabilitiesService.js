@@ -13,30 +13,42 @@ function isActivePremium(flag, expiresAt) {
   return Number.isFinite(exp) && exp > Date.now();
 }
 
-async function canAccessEventViaRpc({ eventId, userId }) {
-  const { data, error } = await supabase.rpc("can_access_event", {
-    event_id: eventId,
-    user_id: userId,
-  });
+async function canUserAccessEvent({ eventId, userId, isPublicEvent }) {
+  // Les événements publics sont accessibles à tous les utilisateurs connectés
+  if (isPublicEvent) return true;
 
-  if (error) {
-    throw Object.assign(new Error("RPC can_access_event indisponible ou en erreur"), {
-      status: 500,
-      code: "ACCESS_RPC_FAILED",
-      cause: error,
-    });
-  }
+  // Vérifier dans event_participants (user_id)
+  const { count: participantCount } = await supabase
+    .from("event_participants")
+    .select("id", { count: "exact", head: true })
+    .eq("event_id", eventId)
+    .eq("user_id", userId);
 
-  if (typeof data === "boolean") return data;
-  if (data && typeof data === "object" && "can_access" in data) return !!data.can_access;
-  return !!data;
+  if ((participantCount || 0) > 0) return true;
+
+  // Fallback : vérifier dans invitations (par email)
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("email")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (!profile?.email) return false;
+
+  const { count: inviteCount } = await supabase
+    .from("invitations")
+    .select("id", { count: "exact", head: true })
+    .eq("event_id", eventId)
+    .eq("email", profile.email);
+
+  return (inviteCount || 0) > 0;
 }
 
 export async function computeEventCapabilities({ userId, eventId }) {
   // 1) Charger l'event
   const { data: event, error: eventErr } = await supabase
     .from("events")
-    .select("id,user_id,is_premium_event,premium_event_expires_at,status,deadline")
+    .select("id,user_id,is_public,is_premium_event,premium_event_expires_at,status,deadline")
     .eq("id", eventId)
     .maybeSingle();
 
@@ -59,7 +71,7 @@ export async function computeEventCapabilities({ userId, eventId }) {
   let isInvited = false;
 
   if (!isCreator) {
-    const canAccess = await canAccessEventViaRpc({ eventId, userId });
+    const canAccess = await canUserAccessEvent({ eventId, userId, isPublicEvent: event.is_public === true });
     isInvited = !!canAccess;
   } else {
     isInvited = true; // creator a accès
