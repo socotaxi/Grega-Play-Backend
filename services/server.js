@@ -557,76 +557,61 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
 
     const { data: event, error } = await supabase
       .from("events")
-      .select("title, final_video_path")
+      .select("title, description, final_video_url, final_video_path")
       .eq("public_code", public_code)
       .single();
 
-    if (error || !event || !event.final_video_path) {
-      return res.status(404).json({ error: "Vidéo finale introuvable" });
+    if (error || !event) {
+      return res.status(404).json({ message: "Événement introuvable" });
     }
 
-    // Si tu stockes déjà une URL complète en DB
-    if (event.final_video_path.startsWith("http")) {
+    // Priorité 1 : final_video_url déjà calculée (URL publique ou signée)
+    if (event.final_video_url?.startsWith("http")) {
       return res.status(200).json({
         title: event.title || "Vidéo finale",
+        description: event.description || null,
+        finalVideoUrl: event.final_video_url,
+      });
+    }
+
+    // Priorité 2 : final_video_path stocké comme URL complète
+    if (event.final_video_path?.startsWith("http")) {
+      return res.status(200).json({
+        title: event.title || "Vidéo finale",
+        description: event.description || null,
         finalVideoUrl: event.final_video_path,
       });
     }
 
-    // ---------------------------------------------------------
-    // ✅ FIX: final_videos est un DOSSIER dans le bucket "videos"
-    // ---------------------------------------------------------
-    let objectPath = String(event.final_video_path || "").trim();
+    // Priorité 3 : final_video_path = chemin dans le bucket "videos" → signed URL
+    if (!event.final_video_path) {
+      return res.status(404).json({ message: "Vidéo finale introuvable. Le montage n'est peut-être pas encore terminé." });
+    }
 
-    // Cas 1: DB stocke "events/<id>/final.mp4" -> on préfixe "final_videos/"
+    let objectPath = String(event.final_video_path).trim().replace(/^\/+/, "");
+
+    // Cas legacy: DB stocke "events/<id>/final.mp4" → préfixe "final_videos/"
     if (objectPath.startsWith("events/")) {
       objectPath = `final_videos/${objectPath}`;
     }
 
-    // Cas 2: DB stocke déjà "final_videos/..." -> on laisse tel quel
-    objectPath = objectPath.replace(/^\/+/, "");
-
-    const dir = objectPath.split("/").slice(0, -1).join("/");
-    const filename = objectPath.split("/").pop();
-
-    // Vérifier existence dans bucket "videos"
-    const { data: listed, error: listErr } = await supabase.storage
-      .from("videos")
-      .list(dir, { limit: 100 });
-
-    if (listErr) {
-      console.error("❌ Storage list error:", listErr);
-    } else {
-      const exists = (listed || []).some((f) => f.name === filename);
-      console.log("🔎 Storage check:", { dir, filename, exists, objectPath });
-
-      if (!exists) {
-        return res.status(404).json({
-          error: "Fichier vidéo introuvable dans le bucket videos",
-          debug: { objectPath },
-        });
-      }
-    }
-
-    // Signer dans bucket "videos"
     const { data: signed, error: signErr } = await supabase.storage
       .from("videos")
       .createSignedUrl(objectPath, 60 * 60); // 1h
 
     if (signErr || !signed?.signedUrl) {
       console.error("❌ Signed URL error:", signErr);
-      return res
-        .status(500)
-        .json({ error: "Impossible de générer le lien vidéo" });
+      return res.status(500).json({ message: "Impossible de générer le lien vidéo" });
     }
 
     return res.status(200).json({
       title: event.title || "Vidéo finale",
+      description: event.description || null,
       finalVideoUrl: signed.signedUrl,
     });
   } catch (e) {
     console.error("❌ public final-video error:", e);
-    return res.status(500).json({ error: "Erreur serveur" });
+    return res.status(500).json({ message: "Erreur serveur" });
   }
 });
 
