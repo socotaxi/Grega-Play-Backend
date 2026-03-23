@@ -630,6 +630,35 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
   }
 });
 
+// GET /api/public/event/:public_code
+publicRouter.get("/event/:public_code", async (req, res) => {
+  try {
+    const { public_code } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select(
+        "id, title, description, theme, deadline, status, is_public, is_premium_event, media_url, public_code"
+      )
+      .eq("public_code", public_code)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ public event fetch error:", error);
+      return res.status(500).json({ error: "Erreur lors du chargement de l'événement." });
+    }
+
+    if (!event) {
+      return res.status(404).json({ error: "Événement introuvable." });
+    }
+
+    return res.status(200).json({ event });
+  } catch (e) {
+    console.error("❌ public event error:", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
 app.use("/api/public", publicRouter);
 
 // ------------------------------------------------------
