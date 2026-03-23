@@ -488,7 +488,7 @@ app.get("/share/e/:public_code", async (req, res) => {
 
     const { data: event, error } = await supabase
       .from("events")
-      .select("title, description, theme, public_code, cover_url")
+      .select("title, description, theme, public_code, cover_url, media_url")
       .eq("public_code", public_code)
       .single();
 
@@ -501,11 +501,21 @@ app.get("/share/e/:public_code", async (req, res) => {
     const appUrl = siteUrl ? `${siteUrl}/e/${public_code}` : `/e/${public_code}`;
 
     const ogTitle = `🎉 ${event.title || "Événement"} – Grega Play`;
-    const ogDesc =
+
+    // Description tronquée à 200 caractères pour WhatsApp
+    const rawDesc =
       (event.description || "").trim() ||
       "Participe à cet événement et ajoute ta vidéo souvenir.";
+    const ogDesc = rawDesc.length > 200 ? rawDesc.slice(0, 197) + "…" : rawDesc;
 
-    const ogImage = siteUrl ? `${siteUrl}/og/event/${public_code}.png` : "";
+    // Utilise la vraie photo de l'événement si c'est une image, sinon l'image générée
+    const isImageUrl = (url) =>
+      /\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i.test(url || "");
+    const eventPhoto =
+      isImageUrl(event.media_url) ? event.media_url :
+      isImageUrl(event.cover_url) ? event.cover_url :
+      null;
+    const ogImage = eventPhoto || (siteUrl ? `${siteUrl}/og/event/${public_code}.png` : "");
 
     res.set("Content-Type", "text/html; charset=utf-8");
     return res.status(200).send(`<!doctype html>
