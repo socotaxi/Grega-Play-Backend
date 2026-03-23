@@ -62,6 +62,35 @@ async function computeOwnerPremium(userId) {
 }
 
 // -------------------------------
+// GET /api/events/:eventId
+// -------------------------------
+router.get("/:eventId", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select("*")
+      .eq("id", eventId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ GET /events/:eventId error:", error);
+      return res.status(500).json({ error: "Erreur lors du chargement de l'événement." });
+    }
+
+    if (!event) {
+      return res.status(404).json({ error: "Événement introuvable." });
+    }
+
+    return res.status(200).json({ event });
+  } catch (e) {
+    console.error("❌ GET /events/:eventId error:", e);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
+// -------------------------------
 // GET /api/events/:eventId/stats
 // - stats UI: totalInvitations / totalWithVideo / totalPending
 // - champs "capabilities-like": videos_count, max_videos, hasReachedUploadLimit, is_effective_premium_event
