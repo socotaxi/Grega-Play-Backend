@@ -51,7 +51,7 @@ if (hasSmtp) {
 /**
  * Envoi générique d'email via SMTP (Brevo) ou SendGrid en fallback
  */
-async function sendMail({ to, subject, html, text }) {
+async function sendMail({ to, subject, html, text, replyTo }) {
   if (hasSmtp) {
     const fromEmail = SMTP_FROM_EMAIL || SMTP_USER;
     const fromName = SMTP_FROM_NAME || "Grega Play";
@@ -62,6 +62,7 @@ async function sendMail({ to, subject, html, text }) {
         subject,
         text,
         html,
+        ...(replyTo ? { replyTo } : {}),
       });
       console.log("📧 Email envoyé via SMTP →", to, "messageId:", info.messageId);
       return info;
@@ -79,6 +80,7 @@ async function sendMail({ to, subject, html, text }) {
       subject,
       text,
       html,
+      ...(replyTo ? { replyTo } : {}),
     };
     try {
       const [response] = await sgMail.send(msg);

@@ -119,23 +119,34 @@ router.get("/:eventId/stats", async (req, res) => {
     // 3) Videos count
     const videos_count = await safeCount("videos", "event_id", eventId);
 
-    // 4) Invitations count
-    // Ton front utilise "invitations" (historique), mais ton ancien bloc testait "event_invites".
-    // On supporte les deux sans casser si une table n'existe pas.
+    // 4) Participants count (from event_participants table)
+    const participants_count = await safeCount("event_participants", "event_id", eventId);
+
+    // Count participants who have submitted a video
+    const { count: submitted_count, error: submittedError } = await supabase
+      .from("event_participants")
+      .select("id", { count: "exact", head: true })
+      .eq("event_id", eventId)
+      .eq("has_submitted", true);
+    const totalWithVideoFromParticipants = submittedError ? 0 : (submitted_count || 0);
+
+    // Fallback: also check legacy invitations tables
     const invitations_count = await safeCount("invitations", "event_id", eventId);
     const event_invites_count = await safeCount("event_invites", "event_id", eventId);
+    const legacy_invites_count = invitations_count > 0 ? invitations_count : event_invites_count;
 
-    const invites_count = invitations_count > 0 ? invitations_count : event_invites_count;
+    // Prefer event_participants (real data), fallback to legacy tables
+    const invites_count = participants_count > 0 ? participants_count : legacy_invites_count;
 
     // 5) Limite upload (aligné capabilities)
     const max_videos = typeof event.max_videos === "number" ? event.max_videos : 0;
     const hasReachedUploadLimit = max_videos > 0 ? videos_count >= max_videos : false;
 
     // 6) Stats UI (indicateurs)
-    // totalWithVideo = indicateur: combien de “participants couverts” par au moins une vidéo
-    // (si premium/multi-vidéos, cet indicateur reste OK comme "avancement", pas comme “vidéos uniques”)
-    const totalInvitations = invites_count;
-    const totalWithVideo = Math.min(videos_count, totalInvitations);
+    // totalWithVideo = actual video count (source of truth for the owner)
+    const totalWithVideo = videos_count;
+    // totalInvitations = max of participants/invites and videos so progress bar never exceeds 100%
+    const totalInvitations = Math.max(invites_count, videos_count);
     const totalPending = Math.max(totalInvitations - totalWithVideo, 0);
 
     return res.json({

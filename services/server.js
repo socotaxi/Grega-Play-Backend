@@ -676,6 +676,107 @@ publicRouter.get("/event/:public_code", async (req, res) => {
   }
 });
 
+// POST /api/public/contact-organizer
+const contactOrganizerRateMap = new Map();
+const CONTACT_WINDOW_MS = 15 * 60 * 1000;
+const CONTACT_MAX = 3;
+
+function isContactRateLimited(key, now) {
+  if (!key) return false;
+  const entry = contactOrganizerRateMap.get(key) || { count: 0, first: now };
+  if (now - entry.first > CONTACT_WINDOW_MS) {
+    entry.count = 0;
+    entry.first = now;
+  }
+  entry.count += 1;
+  contactOrganizerRateMap.set(key, entry);
+  return entry.count > CONTACT_MAX;
+}
+
+publicRouter.post("/contact-organizer", async (req, res) => {
+  try {
+    const { publicCode, senderName, senderEmail, message, website, formCreatedAt } = req.body || {};
+
+    // Honeypot
+    if (website && String(website).trim().length > 0) {
+      return res.status(200).json({ success: true });
+    }
+
+    // Anti-bot timing
+    const now = Date.now();
+    const delta = now - Number(formCreatedAt);
+    if (formCreatedAt && !Number.isNaN(delta) && delta >= 0 && delta < 3000) {
+      return res.status(429).json({ error: "Envoi trop rapide." });
+    }
+
+    // Validation
+    if (!publicCode || !senderName?.trim() || !message?.trim()) {
+      return res.status(400).json({ error: "Champs requis manquants." });
+    }
+
+    // Rate limit par IP et email expéditeur
+    const ip = req.headers["x-real-ip"] || (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket?.remoteAddress || "unknown";
+    if (isContactRateLimited(`ip:${ip}`, now) || isContactRateLimited(`email:${senderEmail.toLowerCase()}`, now)) {
+      return res.status(429).json({ error: "Trop de messages envoyés. Réessayez plus tard." });
+    }
+
+    // Récupérer l'événement et l'user_id du créateur
+    const { data: event, error: evtErr } = await supabase
+      .from("events")
+      .select("id, title, user_id")
+      .eq("public_code", publicCode)
+      .maybeSingle();
+
+    if (evtErr || !event) {
+      return res.status(404).json({ error: "Événement introuvable." });
+    }
+
+    // Récupérer l'email du créateur via l'admin API Supabase
+    const { data: userData, error: userErr } = await supabase.auth.admin.getUserById(event.user_id);
+    if (userErr || !userData?.user?.email) {
+      return res.status(500).json({ error: "Impossible de contacter l'organisateur." });
+    }
+
+    const organizerEmail = userData.user.email;
+
+    const html = `
+      <div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px">
+        <h2 style="color:#4f46e5;margin-bottom:4px">Message d'un participant</h2>
+        <p style="color:#6b7280;font-size:14px;margin-bottom:24px">Événement : <strong>${event.title}</strong></p>
+        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:20px">
+          <p style="margin:0 0 8px 0;font-size:14px"><strong>De :</strong> ${senderName} &lt;${senderEmail}&gt;</p>
+          <p style="margin:0;font-size:15px;white-space:pre-wrap">${message}</p>
+        </div>
+        <p style="font-size:13px;color:#9ca3af">Pour répondre, répondez directement à cet email ou écrivez à ${senderEmail}.</p>
+      </div>`;
+
+    await emailService.sendMail({
+      to: organizerEmail,
+      replyTo: senderEmail,
+      subject: `💬 Message de ${senderName} — ${event.title}`,
+      html,
+      text: `Message de ${senderName} (${senderEmail}) pour l'événement "${event.title}" :\n\n${message}`,
+    });
+
+    // Notification in-app (cloche) — erreur non bloquante
+    const { error: notifErr } = await supabase.from("notifications").insert({
+      user_id: event.user_id,
+      title: `💬 Message de ${senderName}`,
+      message: message.length > 120 ? message.slice(0, 120) + "…" : message,
+      type: "participant_message",
+      link: `/events/${event.id}`,
+      read: false,
+    });
+    if (notifErr) console.warn("⚠️ notification insert error:", notifErr.message);
+
+    console.log(`📩 Contact organisateur: ${senderEmail} → ${organizerEmail} (event: ${event.id})`);
+    return res.status(200).json({ success: true });
+  } catch (e) {
+    console.error("❌ contact-organizer error:", e);
+    return res.status(500).json({ error: "Erreur serveur." });
+  }
+});
+
 app.use("/api/public", publicRouter);
 
 // ------------------------------------------------------

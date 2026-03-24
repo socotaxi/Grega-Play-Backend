@@ -44,6 +44,148 @@ async function canUserAccessEvent({ eventId, userId, isPublicEvent }) {
   return (inviteCount || 0) > 0;
 }
 
+export async function computeBatchEventCapabilities({ userId, eventIds }) {
+  if (!eventIds || eventIds.length === 0) return {};
+
+  // 1) Tous les events en une seule requête
+  const { data: events, error: eventsErr } = await supabase
+    .from("events")
+    .select("id,user_id,is_public,is_premium_event,premium_event_expires_at,status,deadline")
+    .in("id", eventIds);
+
+  if (eventsErr) {
+    throw Object.assign(new Error("Erreur chargement événements"), {
+      status: 500, code: "EVENTS_LOAD_FAILED", cause: eventsErr,
+    });
+  }
+
+  const eventsMap = Object.fromEntries((events || []).map((e) => [e.id, e]));
+  const nonOwnerEventIds = (events || [])
+    .filter((e) => e.user_id !== userId)
+    .map((e) => e.id);
+
+  // 2) Profil user (une seule fois)
+  const { data: profile, error: profErr } = await supabase
+    .from("profiles")
+    .select("id,is_premium_account,premium_account_expires_at,email")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (profErr) {
+    throw Object.assign(new Error("Erreur chargement profil"), {
+      status: 500, code: "PROFILE_LOAD_FAILED", cause: profErr,
+    });
+  }
+  if (!profile) {
+    throw Object.assign(new Error("Profil introuvable."), {
+      status: 404, code: "PROFILE_NOT_FOUND",
+    });
+  }
+
+  // 3) Accès batch : event_participants + invitations
+  const accessibleEventIds = new Set(
+    (events || []).filter((e) => e.is_public === true || e.user_id === userId).map((e) => e.id)
+  );
+
+  if (nonOwnerEventIds.length > 0) {
+    const { data: participations } = await supabase
+      .from("event_participants")
+      .select("event_id")
+      .in("event_id", nonOwnerEventIds)
+      .eq("user_id", userId);
+
+    (participations || []).forEach((p) => accessibleEventIds.add(p.event_id));
+
+    const stillNeedCheck = nonOwnerEventIds.filter((id) => !accessibleEventIds.has(id));
+    if (stillNeedCheck.length > 0 && profile.email) {
+      const { data: invitations } = await supabase
+        .from("invitations")
+        .select("event_id")
+        .in("event_id", stillNeedCheck)
+        .eq("email", profile.email);
+
+      (invitations || []).forEach((inv) => accessibleEventIds.add(inv.event_id));
+    }
+  }
+
+  // 4) Toutes les vidéos de l'user sur ces events en une seule requête
+  const videosByEventId = {};
+  if (nonOwnerEventIds.length > 0) {
+    const { data: videos } = await supabase
+      .from("videos")
+      .select("id,event_id,storage_path,created_at")
+      .in("event_id", nonOwnerEventIds)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    (videos || []).forEach((v) => {
+      if (!videosByEventId[v.event_id]) videosByEventId[v.event_id] = [];
+      videosByEventId[v.event_id].push(v);
+    });
+  }
+
+  // 5) Construire le résultat pour chaque event
+  const results = {};
+  const accountPremiumActive = isActivePremium(profile.is_premium_account, profile.premium_account_expires_at);
+  const now = Date.now();
+
+  for (const eventId of eventIds) {
+    const event = eventsMap[eventId];
+    if (!event) { results[eventId] = null; continue; }
+
+    const isCreator = event.user_id === userId;
+    if (!isCreator && !accessibleEventIds.has(eventId)) { results[eventId] = null; continue; }
+
+    const eventPremiumActive = isActivePremium(event.is_premium_event, event.premium_event_expires_at);
+    const premiumActive = accountPremiumActive || eventPremiumActive;
+    const multiUploadActive = accountPremiumActive;
+    const canDisableWatermark = Boolean(isCreator && premiumActive);
+    const canUsePremiumEditing = Boolean(isCreator && premiumActive);
+
+    const deadlineTs = event.deadline ? new Date(event.deadline).getTime() : null;
+    const isExpired = Number.isFinite(deadlineTs) ? deadlineTs < now : false;
+    const isOpen = event.status === "open";
+
+    const actions = {
+      canUploadVideo: isOpen && !isExpired,
+      canUploadMultipleVideos: multiUploadActive,
+      canGenerateFinalVideo: isCreator,
+      canRegenerateFinalVideo: isCreator && premiumActive,
+      canUsePremiumEditing,
+      canDisableWatermark,
+    };
+    const limits = {
+      maxUploadsPerEvent: multiUploadActive ? 999 : 1,
+      maxClipsSelectableForFinal: premiumActive ? 999 : 5,
+    };
+
+    const myVideos = videosByEventId[eventId] || [];
+    const myUploadCount = myVideos.length;
+    const uploadLimit = limits.maxUploadsPerEvent;
+
+    results[eventId] = {
+      role: { isCreator, isInvited: isCreator || accessibleEventIds.has(eventId) },
+      actions,
+      limits,
+      premium: {
+        active: premiumActive, isPremium: premiumActive, isEffectivePremium: premiumActive,
+        isPremiumAccount: accountPremiumActive, isPremiumEvent: eventPremiumActive,
+        account: { active: accountPremiumActive, expiresAt: profile.premium_account_expires_at || null },
+        event: { active: eventPremiumActive, expiresAt: event.premium_event_expires_at || null },
+        canDisableWatermark, canUsePremiumEditing,
+      },
+      state: {
+        myUploadCount, uploadLimit,
+        hasReachedUploadLimit: myUploadCount >= uploadLimit,
+        latestVideo: myVideos[0] || null,
+        event: { isOpen, isExpired, deadline: event.deadline || null, status: event.status || null },
+      },
+    };
+  }
+
+  return results;
+}
+
 export async function computeEventCapabilities({ userId, eventId }) {
   // 1) Charger l'event
   const { data: event, error: eventErr } = await supabase
