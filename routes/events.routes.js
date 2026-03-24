@@ -62,6 +62,120 @@ async function computeOwnerPremium(userId) {
 }
 
 // -------------------------------
+// POST /api/events/batch-stats
+// Returns stats for multiple events in a single request
+// -------------------------------
+router.post("/batch-stats", async (req, res) => {
+  try {
+    const { eventIds } = req.body;
+    if (!Array.isArray(eventIds) || eventIds.length === 0) {
+      return res.status(400).json({ error: "eventIds requis." });
+    }
+    const ids = eventIds.slice(0, 100); // max 100
+
+    // 1) Fetch all events at once
+    const { data: events, error: eventsError } = await supabase
+      .from("events")
+      .select("id, user_id, max_videos, status, is_premium_event, created_at")
+      .in("id", ids);
+
+    if (eventsError || !events) {
+      return res.status(500).json({ error: "Erreur chargement événements." });
+    }
+
+    // 2) Batch owner premium (deduplicated user_ids)
+    const ownerIds = [...new Set(events.map((e) => e.user_id).filter(Boolean))];
+    const ownerPremiumMap = {};
+    if (ownerIds.length > 0) {
+      const { data: profiles } = await supabase
+        .from("profiles")
+        .select("id, is_premium_account, premium_account_expires_at, is_premium")
+        .in("id", ownerIds);
+      const now = new Date();
+      (profiles || []).forEach((p) => {
+        const expiresAt = toDateOrNull(p.premium_account_expires_at);
+        const hasNewPremium = p.is_premium_account === true && expiresAt && expiresAt > now;
+        const hasLegacyPremium = p.is_premium === true;
+        ownerPremiumMap[p.id] = {
+          owner_has_premium_account: Boolean(hasNewPremium || hasLegacyPremium),
+          owner_premium_expires_at: expiresAt ? expiresAt.toISOString() : null,
+        };
+      });
+    }
+
+    // 3-7) Batch counts — fetch event_id column only, count in JS
+    const [videoRows, participantRows, submittedRows, invitationRows, eventInviteRows] =
+      await Promise.all([
+        supabase.from("videos").select("event_id").in("event_id", ids),
+        supabase.from("event_participants").select("event_id").in("event_id", ids),
+        supabase.from("event_participants").select("event_id").in("event_id", ids).eq("has_submitted", true),
+        supabase.from("invitations").select("event_id").in("event_id", ids),
+        supabase.from("event_invites").select("event_id").in("event_id", ids),
+      ]);
+
+    const toCountMap = (rows) => {
+      const map = {};
+      (rows.data || []).forEach((r) => {
+        map[r.event_id] = (map[r.event_id] || 0) + 1;
+      });
+      return map;
+    };
+    const videoCount = toCountMap(videoRows);
+    const participantCount = toCountMap(participantRows);
+    const submittedCount = toCountMap(submittedRows);
+    const invitationCount = toCountMap(invitationRows);
+    const eventInviteCount = toCountMap(eventInviteRows);
+
+    // Build result map
+    const stats = {};
+    for (const event of events) {
+      const ownerPremium = ownerPremiumMap[event.user_id] || {
+        owner_has_premium_account: false,
+        owner_premium_expires_at: null,
+      };
+      const is_premium_event = event.is_premium_event === true;
+      const is_effective_premium_event = is_premium_event || ownerPremium.owner_has_premium_account;
+
+      const videos_count = videoCount[event.id] || 0;
+      const participants_count = participantCount[event.id] || 0;
+      const invitations_count = invitationCount[event.id] || 0;
+      const event_invites_count = eventInviteCount[event.id] || 0;
+      const legacy_invites_count = invitations_count > 0 ? invitations_count : event_invites_count;
+      const invites_count = participants_count > 0 ? participants_count : legacy_invites_count;
+
+      const max_videos = typeof event.max_videos === "number" ? event.max_videos : 0;
+      const hasReachedUploadLimit = max_videos > 0 ? videos_count >= max_videos : false;
+
+      const totalWithVideo = videos_count;
+      const totalInvitations = Math.max(invites_count, videos_count);
+      const totalPending = Math.max(totalInvitations - totalWithVideo, 0);
+
+      stats[event.id] = {
+        totalInvitations,
+        totalWithVideo,
+        totalPending,
+        event_id: event.id,
+        status: event.status ?? "open",
+        created_at: event.created_at,
+        creator_user_id: event.user_id,
+        videos_count,
+        invites_count,
+        max_videos,
+        hasReachedUploadLimit,
+        is_premium_event,
+        ...ownerPremium,
+        is_effective_premium_event,
+      };
+    }
+
+    return res.json({ stats });
+  } catch (e) {
+    console.error("❌ /events/batch-stats error:", e);
+    return res.status(500).json({ error: "Erreur interne batch-stats." });
+  }
+});
+
+// -------------------------------
 // GET /api/events/:eventId
 // -------------------------------
 router.get("/:eventId", async (req, res) => {
