@@ -480,6 +480,177 @@ app.get("/og/event/:public_code.png", async (req, res) => {
 });
 
 // ------------------------------------------------------
+// ✅ OG IMAGE pour la vidéo finale
+// URL : /og/video/:public_code.png
+// ------------------------------------------------------
+app.get("/og/video/:public_code.png", async (req, res) => {
+  try {
+    const { public_code } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select("id, title, theme")
+      .eq("public_code", public_code)
+      .single();
+
+    if (error || !event) return res.status(404).send("Not found");
+
+    const { count: videosCount } = await supabase
+      .from("videos")
+      .select("*", { count: "exact", head: true })
+      .eq("event_id", event.id);
+
+    const title = (event.title || "Événement").trim();
+    const count = videosCount ?? 0;
+
+    const W = 1200;
+    const H = 630;
+    const bg1 = "#0B1220";
+    const bg2 = "#111827";
+    const accent = "#10B981";
+
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="${bg1}"/>
+      <stop offset="1" stop-color="${bg2}"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect width="${W}" height="${H}" fill="url(#g)"/>
+
+  <!-- Accent shapes -->
+  <circle cx="980" cy="120" r="180" fill="${accent}" opacity="0.18"/>
+  <circle cx="1100" cy="520" r="260" fill="${accent}" opacity="0.12"/>
+  <rect x="70" y="460" width="1060" height="6" fill="${accent}" opacity="0.55"/>
+
+  <!-- Card -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="90" rx="28" ry="28" width="1060" height="360" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)"/>
+  </g>
+
+  <!-- Play circle -->
+  <circle cx="160" cy="155" r="32" fill="${accent}" opacity="0.9"/>
+  <polygon points="150,140 150,170 178,155" fill="#fff"/>
+
+  <!-- Branding -->
+  <text x="210" y="150" fill="rgba(255,255,255,0.85)" font-size="30" font-family="Arial, Helvetica, sans-serif" font-weight="700">Grega Play</text>
+  <text x="210" y="180" fill="${accent}" font-size="22" font-family="Arial, Helvetica, sans-serif">Montage vidéo collectif</text>
+
+  <!-- Title -->
+  ${svgMultilineText(title, 110, 260, 58, 44, 3)}
+
+  <!-- Stats -->
+  <text x="110" y="415" fill="rgba(255,255,255,0.65)" font-size="26" font-family="Arial, Helvetica, sans-serif">
+    ${escapeXml(count > 0 ? `${count} clip${count > 1 ? "s" : ""} rassemblés dans ce montage` : "Regardez le montage collectif")}
+  </text>
+
+  <!-- Footer -->
+  <text x="110" y="560" fill="rgba(255,255,255,0.65)" font-size="24" font-family="Arial, Helvetica, sans-serif">
+    Une vidéo collective, créée ensemble.
+  </text>
+
+  <!-- Badge -->
+  <g>
+    <rect x="900" y="520" rx="18" ry="18" width="230" height="54" fill="${accent}" opacity="0.95"/>
+    <text x="1015" y="556" text-anchor="middle" fill="#062014" font-size="24" font-family="Arial, Helvetica, sans-serif" font-weight="800">
+      ▶ Regarder
+    </text>
+  </g>
+</svg>`;
+
+    const pngBuffer = await sharp(Buffer.from(svg))
+      .png({ quality: 90 })
+      .toBuffer();
+
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=3600");
+    return res.status(200).send(pngBuffer);
+  } catch (e) {
+    console.error("❌ OG video image error:", e);
+    return res.status(500).send("Server error");
+  }
+});
+
+// ------------------------------------------------------
+// ✅ Page de partage pour la vidéo finale (WhatsApp / Instagram)
+// URL à partager : https://ton-domaine/share/v/:public_code
+// ------------------------------------------------------
+app.get("/share/v/:public_code", async (req, res) => {
+  try {
+    const { public_code } = req.params;
+
+    const { data: event, error } = await supabase
+      .from("events")
+      .select("id, title, description, theme, public_code")
+      .eq("public_code", public_code)
+      .single();
+
+    if (error || !event) {
+      console.warn("❌ /share/v/:public_code introuvable:", error);
+      return res.status(404).send("Not found");
+    }
+
+    const { count: videosCount } = await supabase
+      .from("videos")
+      .select("*", { count: "exact", head: true })
+      .eq("event_id", event.id);
+
+    const count = videosCount ?? 0;
+
+    const siteUrl = getPublicSiteUrl(req);
+    const appUrl = siteUrl ? `${siteUrl}/player/${public_code}` : `/player/${public_code}`;
+
+    const backendProto = ((req.headers["x-forwarded-proto"] || req.protocol || "https") + "")
+      .split(",")[0].trim();
+    const backendHost = ((req.headers["x-forwarded-host"] || req.headers.host || "") + "")
+      .split(",")[0].trim();
+    const backendUrl = backendHost ? `${backendProto}://${backendHost}` : "";
+
+    const ogTitle = `🎬 ${event.title || "Montage"} – Grega Play`;
+    const rawDesc = count > 0
+      ? `${count} clip${count > 1 ? "s" : ""} rassemblés en un montage collectif. Regardez la vidéo !`
+      : (event.description || "").trim() || "Un montage vidéo créé ensemble. Regardez !";
+    const ogDesc = rawDesc.length > 200 ? rawDesc.slice(0, 197) + "…" : rawDesc;
+    const ogImage = backendUrl ? `${backendUrl}/og/video/${public_code}.png` : "";
+
+    res.set("Content-Type", "text/html; charset=utf-8");
+    return res.status(200).send(`<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <title>${escapeHtml(ogTitle)}</title>
+
+  <meta property="og:title" content="${escapeAttr(ogTitle)}" />
+  <meta property="og:description" content="${escapeAttr(ogDesc)}" />
+  ${ogImage ? `<meta property="og:image" content="${escapeAttr(ogImage)}" />` : ""}
+  <meta property="og:url" content="${escapeAttr(appUrl)}" />
+  <meta property="og:type" content="video.other" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${escapeAttr(ogTitle)}" />
+  <meta name="twitter:description" content="${escapeAttr(ogDesc)}" />
+  ${ogImage ? `<meta name="twitter:image" content="${escapeAttr(ogImage)}" />` : ""}
+
+  <meta http-equiv="refresh" content="0;url=${escapeAttr(appUrl)}" />
+</head>
+<body>
+  Redirection… <a href="${escapeAttr(appUrl)}">Regarder le montage</a>
+</body>
+</html>`);
+  } catch (e) {
+    console.error("❌ Erreur /share/v/:public_code:", e);
+    return res.status(500).send("Server error");
+  }
+});
+
+// ------------------------------------------------------
 // ✅ Page publique serveur pour preview WhatsApp / Instagram-like
 // URL à partager : https://ton-domaine/share/e/:public_code
 // ------------------------------------------------------
@@ -574,7 +745,7 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
 
     const { data: event, error } = await supabase
       .from("events")
-      .select("title, description, final_video_url, final_video_path")
+      .select("id, title, description, theme, deadline, media_url, public_code, final_video_url, final_video_path")
       .eq("public_code", public_code)
       .single();
 
@@ -591,6 +762,29 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
       final_video_path: event.final_video_path,
     });
 
+    // Compter les participants et les vidéos soumises
+    const [{ count: participantsCount }, { count: videosCount }] = await Promise.all([
+      supabase
+        .from("event_participants")
+        .select("*", { count: "exact", head: true })
+        .eq("event_id", event.id),
+      supabase
+        .from("videos")
+        .select("*", { count: "exact", head: true })
+        .eq("event_id", event.id),
+    ]);
+
+    const meta = {
+      title: event.title || "Vidéo finale",
+      description: event.description || null,
+      theme: event.theme || null,
+      deadline: event.deadline || null,
+      mediaUrl: event.media_url || null,
+      publicCode: event.public_code,
+      participantsCount: participantsCount ?? 0,
+      videosCount: videosCount ?? 0,
+    };
+
     // Extraire l'URL depuis final_video_url (peut être une string ou un objet { videoUrl: "..." })
     const rawFinalUrl = event.final_video_url;
     const resolvedFinalUrl =
@@ -600,20 +794,12 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
 
     // Priorité 1 : final_video_url déjà calculée (URL publique ou signée)
     if (resolvedFinalUrl?.startsWith("http")) {
-      return res.status(200).json({
-        title: event.title || "Vidéo finale",
-        description: event.description || null,
-        finalVideoUrl: resolvedFinalUrl,
-      });
+      return res.status(200).json({ ...meta, finalVideoUrl: resolvedFinalUrl });
     }
 
     // Priorité 2 : final_video_path stocké comme URL complète
     if (event.final_video_path?.startsWith("http")) {
-      return res.status(200).json({
-        title: event.title || "Vidéo finale",
-        description: event.description || null,
-        finalVideoUrl: event.final_video_path,
-      });
+      return res.status(200).json({ ...meta, finalVideoUrl: event.final_video_path });
     }
 
     // Priorité 3 : final_video_path = chemin dans le bucket "videos" → signed URL
@@ -637,11 +823,7 @@ publicRouter.get("/final-video/:public_code", async (req, res) => {
       return res.status(500).json({ message: "Impossible de générer le lien vidéo" });
     }
 
-    return res.status(200).json({
-      title: event.title || "Vidéo finale",
-      description: event.description || null,
-      finalVideoUrl: signed.signedUrl,
-    });
+    return res.status(200).json({ ...meta, finalVideoUrl: signed.signedUrl });
   } catch (e) {
     console.error("❌ public final-video error:", e);
     return res.status(500).json({ message: "Erreur serveur" });
