@@ -127,4 +127,29 @@ router.post("/test", async (req, res) => {
   }
 });
 
+/**
+ * DELETE /api/notifications/all
+ * Body JSON: { "userId": "uuid_supabase" }
+ * -> Supprime toutes les notifications d'un utilisateur
+ */
+router.delete("/all", async (req, res) => {
+  const { userId } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: "userId manquant" });
+  }
+
+  const { error } = await supabase
+    .from("notifications")
+    .delete()
+    .eq("user_id", userId);
+
+  if (error) {
+    console.error("❌ Erreur suppression notifications :", error);
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ success: true });
+});
+
 export default router;

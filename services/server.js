@@ -27,6 +27,7 @@ import videosRoutes from "../routes/videos.routes.js";
 
 // ✅ NEW (Étape 8): routes assets premium (bucket privé premium-assets)
 import assetsRoutes from "../routes/assets.routes.js";
+import activityRoutes from "../routes/activity.routes.js";
 
 dotenv.config();
 global.fetch = fetch;
@@ -801,6 +802,7 @@ app.use("/api/videos", videosRoutes);
 
 // 🔔 notifications push
 app.use("/api/notifications", notificationsRouter);
+app.use("/api/activity", activityRoutes);
 
 // ------------------------------------------------------
 // 🧩 Helper : extraire bucket + path depuis une URL publique Supabase
