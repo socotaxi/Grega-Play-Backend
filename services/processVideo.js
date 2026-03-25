@@ -581,6 +581,18 @@ function isLikelyPng(buf) {
   );
 }
 
+function isLikelyImage(buf) {
+  if (!buf || buf.length < 4) return false;
+  // PNG
+  if (isLikelyPng(buf)) return true;
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true;
+  // WebP: RIFF....WEBP
+  if (buf.length >= 12 && buf.slice(0, 4).toString("ascii") === "RIFF" &&
+      buf.slice(8, 12).toString("ascii") === "WEBP") return true;
+  return false;
+}
+
 function isLikelyAudio(buf) {
   if (!buf || buf.length < 12) return false;
   const riff = buf.slice(0, 4).toString("ascii");
@@ -604,12 +616,12 @@ async function downloadFromSupabaseBucket(bucket, storagePath, localPath, { expe
   const ab = await data.arrayBuffer();
   const buf = Buffer.from(ab);
 
-  if (expect === "png" && !isLikelyPng(buf)) {
-    logJson("❌ premium asset not PNG", {
+  if (expect === "png" && !isLikelyImage(buf)) {
+    logJson("❌ premium asset not an image (PNG/JPEG/WebP)", {
       bucket,
       storagePath,
       localPath,
-      head: buf.slice(0, 32).toString("utf8"),
+      head: buf.slice(0, 32).toString("hex"),
     });
     return false;
   }
@@ -889,43 +901,48 @@ async function addIntroOutroNoMusic(corePath, outputPath, introPath, outroPath, 
   const outroDur = 2;
   const coreDur = await getVideoDurationSafe(corePath, "core_for_intro_outro");
 
-  
-  const targetSec = introDur + (coreDur || 0) + outroDur;
-  const totalDur = introDur + (coreDur || 0) + outroDur || null;
+  const safeCore = Number.isFinite(coreDur) ? coreDur : 0;
+  const targetSec = introDur + safeCore + outroDur;
 
   const coreHasAudio = await hasAudioStream(corePath);
 
-  const silenceInput = `-f lavfi -t ${Math.max(1, Math.ceil(totalDur || 6))} -i "anullsrc=channel_layout=stereo:sample_rate=48000"`;
-
- let filter;
-
-if (coreHasAudio) {
-  filter =
+  // Scale all 3 inputs to same size/format, then concat
+  let filter =
+    `[0:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
+    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v0];` +
     `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-    `fps=30,setsar=1,format=yuv420p[v1]`;
-} else {
-  filter =
-    `[1:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,` +
-    `fps=30,setsar=1,format=yuv420p[v1]`;
-}
+    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v1];` +
+    `[2:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
+    `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v2];` +
+    `[v0][v1][v2]concat=n=3:v=1:a=0,trim=duration=${targetSec},setpts=PTS-STARTPTS[v]`;
 
-const cleanFilter = filter.trim();
+  let audioMap;
+  let silenceArg = "";
 
+  if (coreHasAudio) {
+    filter +=
+      `;[1:a]adelay=${Math.round(introDur * 1000)}|${Math.round(introDur * 1000)},` +
+      `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=48000,` +
+      `atrim=duration=${targetSec},asetpts=PTS-STARTPTS[a]`;
+    audioMap = `-map "[a]"`;
+  } else {
+    // Input 3: silence (intro=0, core=1, outro=2, silence=3)
+    silenceArg = `-f lavfi -t ${Math.ceil(targetSec)} -i "anullsrc=channel_layout=stereo:sample_rate=48000" `;
+    audioMap = `-map 3:a`;
+  }
 
   const cmd =
     `ffmpeg -nostdin -y -loop 1 -t ${introDur} -i "${introPath}" ` +
     `-i "${corePath}" -loop 1 -t ${outroDur} -i "${outroPath}" ` +
-    `${silenceInput} -filter_complex "${cleanFilter}" ` +
-    `-map "[v1]" -map 1:a? -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
+    `${silenceArg}-filter_complex "${filter}" ` +
+    `-map "[v]" ${audioMap} -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest "${outputPath}"`;
 
   console.log("➡️ FFmpeg intro/outro:", cmd);
   await runFfmpegWithProgress(cmd, {
     jobId,
     step: "intro_outro",
     label: "intro_outro",
-    totalDurationSec: totalDur,
+    totalDurationSec: targetSec,
     progressBase,
     progressSpan,
     message: "Intro/Outro en cours...",
