@@ -12,7 +12,6 @@ import sharp from "sharp";
 import notificationsRouter from "../routes/notifications.js";
 import { sendPushNotification } from "./pushService.js"; // (import conservé si utilisé ailleurs)
 import emailRoutes from "../routes/emailRoutes.js";
-import whatsappAuthRoutes from "../routes/whatsappAuthRoutes.js";
 import emailService from "./emailService.js";
 
 import stripePackage from "stripe";
@@ -1012,71 +1011,6 @@ function getBucketAndPathFromPublicUrl(publicUrl) {
     return null;
   }
 }
-
-// ------------------------------------------------------
-// 🔔 Relance des participants à J-1 de la deadline
-// ------------------------------------------------------
-app.post("/api/events/:eventId/remind", async (req, res) => {
-  const { eventId } = req.params;
-
-  try {
-    const { data: event, error: eventError } = await supabase
-      .from("events")
-      .select("id, title, description, deadline, user_id, public_code")
-      .eq("id", eventId)
-      .single();
-
-    if (eventError || !event) {
-      console.error("❌ Événement introuvable pour relance:", eventError);
-      return res.status(404).json({ error: "Événement introuvable." });
-    }
-
-    const { data: participants, error: participantsError } = await supabase
-      .from("event_participants")
-      .select("email, name, has_submitted")
-      .eq("event_id", eventId);
-
-    if (participantsError) {
-      console.error("❌ Erreur récupération participants:", participantsError);
-      return res.status(500).json({
-        error: "Erreur lors de la récupération des participants.",
-      });
-    }
-
-    const participantsToRemind = (participants || []).filter(
-      (p) => !p.has_submitted && p.email
-    );
-
-    if (participantsToRemind.length === 0) {
-      return res.status(200).json({
-        message: "Aucun participant à relancer (tous ont soumis une vidéo).",
-      });
-    }
-
-    const publicSiteUrl = process.env.PUBLIC_SITE_URL || "";
-    const eventLink = event.public_code
-      ? `${publicSiteUrl}/e/${event.public_code}`
-      : publicSiteUrl;
-
-    const { sent, failed } = await emailService.sendReminderToParticipants({
-      event,
-      participants: participantsToRemind,
-      eventLink,
-    });
-
-    return res.status(200).json({
-      message: "Emails de relance envoyés aux participants en attente.",
-      count: participantsToRemind.length,
-      sent,
-      failed,
-    });
-  } catch (err) {
-    console.error("❌ Erreur /api/events/:eventId/remind:", err);
-    return res.status(500).json({
-      error: "Erreur interne lors de l'envoi des relances.",
-    });
-  }
-});
 
 // ------------------------------------------------------
 // 🔔 Stats d'installation PWA

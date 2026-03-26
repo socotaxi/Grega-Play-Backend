@@ -48,6 +48,7 @@ const EXEC_MAX_BUFFER = Number(process.env.EXEC_MAX_BUFFER || 50 * 1024 * 1024);
 // ✅ Runtime job map (pour getVideoJobStatus)
 // ------------------------------------------------------
 const RUNTIME_JOBS = new Map();
+const RUNTIME_JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 heures
 
 function setRuntime(jobId, patch) {
   if (!jobId) return;
@@ -59,6 +60,16 @@ export function getVideoJobStatus(jobId) {
   if (!jobId) return null;
   return RUNTIME_JOBS.get(jobId) || null;
 }
+
+// Nettoyage périodique des jobs terminés ou anciens (évite la fuite mémoire)
+setInterval(() => {
+  const cutoff = Date.now() - RUNTIME_JOB_TTL_MS;
+  for (const [id, job] of RUNTIME_JOBS.entries()) {
+    const isDone = job.step === "done" || job.step === "failed";
+    const isOld = new Date(job.updatedAt).getTime() < cutoff;
+    if (isDone || isOld) RUNTIME_JOBS.delete(id);
+  }
+}, 30 * 60 * 1000); // toutes les 30 minutes
 
 // ------------------------------------------------------
 // ✅ TRANSITIONS: support UI/schema (modern_1..5) + noms xfade directs

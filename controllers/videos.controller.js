@@ -4,8 +4,6 @@ import path from "path";
 import util from "util";
 import { exec } from "child_process";
 import { fileURLToPath } from "url";
-import https from "https";
-import http from "http";
 import fetch from "cross-fetch";
 import { createClient } from "@supabase/supabase-js";
 
@@ -102,23 +100,6 @@ function sanitizeFileName(name = "video") {
   return base.length ? base : `video_${Date.now()}`;
 }
 
-function downloadFile(url, outputPath) {
-  const client = url.startsWith("https") ? https : http;
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(outputPath);
-
-    const req = client.get(url, { rejectUnauthorized: false }, (res) => {
-      if (res.statusCode !== 200) {
-        return reject(new Error(`Échec téléchargement ${url}: ${res.statusCode}`));
-      }
-      res.pipe(file);
-      file.on("finish", () => file.close(resolve));
-    });
-
-    req.on("error", reject);
-    req.end();
-  });
-}
 
 async function getVideoDuration(filePath) {
   try {
@@ -203,7 +184,7 @@ function getBucketAndPathFromPublicUrl(publicUrl) {
 
 
 
-const ADMIN_EMAIL = "edhemrombhot@gmail.com";
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
 
 function isAdminUploader(participantEmail) {
   return String(participantEmail || "").toLowerCase() === ADMIN_EMAIL;

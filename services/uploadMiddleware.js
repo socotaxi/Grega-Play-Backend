@@ -22,10 +22,10 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 
 // Configuration du stockage Multer
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
+  destination: (_req, _file, cb) => {
     cb(null, UPLOAD_DIR);
   },
-  filename: (req, file, cb) => {
+  filename: (_req, file, cb) => {
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
     const ext = path.extname(file.originalname || "");
     cb(null, `${uniqueSuffix}${ext}`);
@@ -35,7 +35,7 @@ const storage = multer.diskStorage({
 // Instance Multer exportée
 // ⚠️ Important: on ne met PAS de limite globale ici.
 // Les limites sont gérées par les "capabilities" + validation côté frontend,
-// avec une exception admin (edhemrombhot@gmail.com) qui ne doit pas être limité.
+// avec une exception admin (définie via ADMIN_EMAIL) qui ne doit pas être limitée.
 export const upload = multer({
   storage,
 });
