@@ -1160,7 +1160,11 @@ export default async function processVideo(eventId, selectedVideoIds, effectiveP
 
     if (error) throw new Error("Erreur récupération vidéos sélectionnées.");
 
-    const videosToProcess = (videos || []).filter((v) => v.storage_path);
+    const filtered = (videos || []).filter((v) => v.storage_path);
+    // Reorder to match the user-specified selectedVideoIds order
+    const videosToProcess = selectedVideoIds
+      .map((id) => filtered.find((v) => v.id === id))
+      .filter(Boolean);
     if (videosToProcess.length < 2) throw new Error("Pas assez de vidéos valides pour lancer le montage.");
 
     // ✅ temp: /tmp (os.tmpdir()) sur Railway/Linux
