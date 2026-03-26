@@ -27,6 +27,7 @@ import videosRoutes from "../routes/videos.routes.js";
 // ✅ NEW (Étape 8): routes assets premium (bucket privé premium-assets)
 import assetsRoutes from "../routes/assets.routes.js";
 import activityRoutes from "../routes/activity.routes.js";
+import guestVideoRoutes from "../routes/guestVideoRoutes.js";
 
 dotenv.config();
 global.fetch = fetch;
@@ -736,6 +737,9 @@ app.get("/share/e/:public_code", async (req, res) => {
 // 🌍 ROUTES PUBLIQUES
 // ------------------------------------------------------
 const publicRouter = express.Router();
+
+// Upload invité (sans compte) — POST /api/public/videos/upload
+publicRouter.use("/videos", guestVideoRoutes);
 
 // GET /api/public/final-video/:public_code
 publicRouter.get("/final-video/:public_code", async (req, res) => {
